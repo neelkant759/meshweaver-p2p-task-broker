@@ -1,5 +1,156 @@
 """
-MeshWeaver - UDP Server
-Module for handling asynchronous UDP server operations using Python asyncio and sockets.
-(Implementation to be added in Week 1).
+MeshWeaver - Asynchronous UDP Server
+Module 1 of Week 1: Core Networking Layer
+
+This module implements an asynchronous UDP server using Python's built-in
+`socket` and `asyncio` modules. It binds to a configured IP and port,
+continuously listens for incoming datagrams, handles PING-PONG health checks,
+and gracefully recovers from communication anomalies and shutdown signals.
 """
+
+from __future__ import annotations
+
+import asyncio
+import errno
+import socket
+import sys
+from typing import Tuple
+
+# Default Server Configuration
+DEFAULT_HOST: str = "127.0.0.1"
+DEFAULT_PORT: int = 8000
+BUFFER_SIZE: int = 4096
+
+
+def create_udp_socket(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> socket.socket:
+    """
+    Creates, configures, and binds a non-blocking IPv4 UDP socket.
+
+    Args:
+        host: IP address to bind (defaults to 127.0.0.1).
+        port: Port number to listen on (defaults to 8000).
+
+    Returns:
+        socket.socket: Bound non-blocking UDP socket.
+
+    Raises:
+        OSError: If port is occupied or socket creation fails.
+    """
+    try:
+        # Create an IPv4 (AF_INET) datagram (SOCK_DGRAM) socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Enable non-blocking mode for asynchronous event loop integration
+        sock.setblocking(False)
+        # Bind the socket to the target address and port
+        sock.bind((host, port))
+        return sock
+    except OSError as err:
+        # Check for address already in use (EADDRINUSE / WSAEADDRINUSE)
+        if err.errno == errno.EADDRINUSE or getattr(err, "winerror", None) == 10048:
+            print(f"\n[Error] Port {port} is already in use by another application.")
+            print("Please terminate the occupying process or select a different port.")
+        else:
+            print(f"\n[Error] Failed to create and bind socket: {err}")
+        raise
+
+
+async def handle_message(
+    loop: asyncio.AbstractEventLoop,
+    sock: socket.socket,
+    data: bytes,
+    addr: Tuple[str, int],
+) -> None:
+    """
+    Processes a received datagram and dispatches the appropriate response.
+
+    Args:
+        loop: The active asyncio event loop.
+        sock: The active non-blocking UDP socket.
+        data: Raw received payload bytes.
+        addr: Tuple of (client_ip, client_port).
+    """
+    try:
+        # Decode received bytes to string
+        message = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        print(f"Received malformed non-UTF8 payload from {addr}")
+        error_response = b"ERROR: Invalid payload encoding (expected UTF-8)"
+        try:
+            await loop.sock_sendto(sock, error_response, addr)
+        except OSError as send_err:
+            print(f"Failed to send error response to {addr}: {send_err}")
+        return
+
+    print(f"Received from {addr}: {message}")
+
+    # Process message logic
+    if message == "PING":
+        response = b"PONG"
+        try:
+            await loop.sock_sendto(sock, response, addr)
+            print("Sent response: PONG")
+        except OSError as send_err:
+            print(f"Failed to send PONG to {addr}: {send_err}")
+    else:
+        # Handle unexpected message
+        response = f"ERROR: Unexpected message '{message}'. Expected 'PING'.".encode("utf-8")
+        try:
+            await loop.sock_sendto(sock, response, addr)
+            print(f"Sent response: ERROR (Unexpected message)")
+        except OSError as send_err:
+            print(f"Failed to send response to {addr}: {send_err}")
+
+
+async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    """
+    Runs the asynchronous UDP server event loop.
+
+    Continuously listens for incoming datagrams using `loop.sock_recvfrom`
+    and dispatches them for processing without blocking the event loop.
+
+    Args:
+        host: IP address to bind.
+        port: Port number to bind.
+    """
+    sock: socket.socket | None = None
+    try:
+        sock = create_udp_socket(host, port)
+    except OSError:
+        sys.exit(1)
+
+    loop = asyncio.get_running_loop()
+
+    print("\nMeshWeaver UDP Server Started")
+    print(f"Server IP: {host}")
+    print(f"Server Port: {port}")
+    print("Waiting for incoming messages...\n", flush=True)
+
+    try:
+        while True:
+            try:
+                # Asynchronously wait for incoming datagram
+                data, addr = await loop.sock_recvfrom(sock, BUFFER_SIZE)
+                await handle_message(loop, sock, data, addr)
+            except asyncio.CancelledError:
+                # Raised when the server task is cancelled during shutdown
+                break
+            except OSError as sock_err:
+                # Handle unexpected socket error during reception
+                print(f"[Warning] Socket communication error: {sock_err}")
+                await asyncio.sleep(0.05)
+    finally:
+        if sock:
+            sock.close()
+            print("\nSocket successfully closed.")
+
+
+def main() -> None:
+    """Main application entry point."""
+    try:
+        asyncio.run(run_server(DEFAULT_HOST, DEFAULT_PORT))
+    except KeyboardInterrupt:
+        print("\nMeshWeaver UDP Server stopped cleanly.")
+
+
+if __name__ == "__main__":
+    main()
