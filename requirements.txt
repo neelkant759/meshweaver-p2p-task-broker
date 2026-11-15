@@ -1,0 +1,5 @@
+# MeshWeaver Dependencies
+
+# Proposed dependency for Python function serialization across peers
+# Note: Pending mentor approval
+cloudpickle>=3.0.0
