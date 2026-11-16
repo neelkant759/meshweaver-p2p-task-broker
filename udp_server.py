@@ -36,15 +36,16 @@ def create_udp_socket(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> soc
     Raises:
         OSError: If port is occupied or socket creation fails.
     """
+    # Create an IPv4 (AF_INET) datagram (SOCK_DGRAM) socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Create an IPv4 (AF_INET) datagram (SOCK_DGRAM) socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Enable non-blocking mode for asynchronous event loop integration
         sock.setblocking(False)
         # Bind the socket to the target address and port
         sock.bind((host, port))
         return sock
     except OSError as err:
+        sock.close()
         # Check for address already in use (EADDRINUSE / WSAEADDRINUSE)
         if err.errno == errno.EADDRINUSE or getattr(err, "winerror", None) == 10048:
             print(f"\n[Error] Port {port} is already in use by another application.")

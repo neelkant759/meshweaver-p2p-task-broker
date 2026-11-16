@@ -11,13 +11,13 @@ The project is structured into four weekly implementation phases.
 
 ### Scope & Status
 1. **Project Structure Creation**: **Completed** (Initial files, directories, and manifests scaffolded).
-2. **Asynchronous UDP Server**: **Pending** (To be implemented using Python `asyncio` and sockets).
-3. **Asynchronous UDP Client**: **Pending** (To be implemented for asynchronous datagram dispatch).
-4. **PING-PONG Communication**: **Pending** (Targeting round-trip verification between two Python runtime instances).
+2. **Asynchronous UDP Server**: **Completed** (Implemented in `udp_server.py` using Python `asyncio` and `socket`).
+3. **Asynchronous UDP Client**: **Completed** (Implemented in `udp_client.py` using Python `asyncio` and `socket`).
+4. **PING-PONG Communication**: **Completed** (Verified across separate processes and in automated test suites).
 5. **Function Serialization**: **Proposed (Pending Mentor Approval)** (Evaluation of `cloudpickle`; implementation pending).
 6. **Remote Function Execution & Result Handling**: **Pending** (Execution engine and result pipeline to be implemented).
-7. **Automated Testing**: **Pending** (Unit test suites in `tests/` to be implemented using Python `unittest`).
-8. **Documentation & Progress Reporting**: **In Progress** (Scaffolding documentation completed; implementation details pending).
+7. **Automated Testing**: **In Progress** (Unit & integration test suites for UDP server and client active in `tests/test_udp.py`).
+8. **Documentation & Progress Reporting**: **In Progress** (Modules 1 & 2 documentation and reports completed; subsequent modules pending).
 
 ---
 
@@ -27,13 +27,13 @@ meshweaver-p2p-task-broker/
 ├── README.md               # Project documentation and roadmap
 ├── WEEK1_REPORT.md         # Week 1 status report and implementation checklist
 ├── requirements.txt        # Proposed dependencies (cloudpickle pending mentor approval)
-├── udp_server.py           # Asynchronous UDP server module (scaffolded, implementation pending)
-├── udp_client.py           # Asynchronous UDP client module (scaffolded, implementation pending)
+├── udp_server.py           # Asynchronous UDP server module (implemented)
+├── udp_client.py           # Asynchronous UDP client module (implemented)
 ├── serializer.py           # Task & function serializer module (scaffolded, implementation pending)
 ├── executor.py             # Remote execution engine (scaffolded, implementation pending)
 └── tests/                  # Automated unit test suite
     ├── __init__.py         # Test package initialization
-    ├── test_udp.py         # UDP networking tests (scaffolded, tests pending)
+    ├── test_udp.py         # UDP networking unit and integration tests (implemented)
     └── test_serializer.py  # Serialization tests (scaffolded, tests pending)
 ```
 
@@ -43,19 +43,25 @@ meshweaver-p2p-task-broker/
 ### Prerequisites
 - Python 3.10+ recommended
 
-### Environment Setup
+### Running the UDP Server
 ```bash
-python -m venv venv
-# On Windows:
-.\venv\Scripts\activate
-# On Linux/macOS:
-source venv/bin/activate
+python udp_server.py
+```
 
-# Install proposed dependencies once approved:
-pip install -r requirements.txt
+### Running the UDP Client
+```bash
+# Send default PING
+python udp_client.py
+
+# Send custom message with specific timeout
+python udp_client.py --message "PING" --timeout 2.0
 ```
 
 ### Running Tests
 ```bash
+# Run all unit tests
 python -m unittest discover tests
+
+# Run UDP test suite specifically
+python -m unittest tests/test_udp.py
 ```
