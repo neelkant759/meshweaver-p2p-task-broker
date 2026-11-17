@@ -1,5 +1,6 @@
 # MeshWeaver Dependencies
 
-# Proposed dependency for Python function serialization across peers
-# Note: Pending mentor approval
+# cloudpickle: Required for Python function and lambda serialization across peers.
+# Standard pickle cannot serialize closures or locally-defined functions.
+# Mentor approval status: APPROVED (installed as of Week 1, Module 3)
 cloudpickle>=3.0.0

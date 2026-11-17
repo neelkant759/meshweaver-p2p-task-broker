@@ -6,6 +6,12 @@ This module implements an asynchronous UDP server using Python's built-in
 `socket` and `asyncio` modules. It binds to a configured IP and port,
 continuously listens for incoming datagrams, handles PING-PONG health checks,
 and gracefully recovers from communication anomalies and shutdown signals.
+
+Week 1 Module 3/4 extension:
+  The server now also recognises MeshWeaver task payloads (identified by the
+  TASK_MAGIC_PREFIX from serializer.py). When a task packet is received it is
+  forwarded to executor.execute_task() and the result bytes are sent back to
+  the requesting peer. Plain PING-PONG health checks are fully preserved.
 """
 
 from __future__ import annotations
@@ -15,6 +21,9 @@ import errno
 import socket
 import sys
 from typing import Tuple
+
+from executor import execute_task
+from serializer import is_task_payload
 
 # Default Server Configuration
 DEFAULT_HOST: str = "127.0.0.1"
@@ -64,12 +73,30 @@ async def handle_message(
     """
     Processes a received datagram and dispatches the appropriate response.
 
+    Handles three classes of incoming message:
+      1. MeshWeaver task payload  (binary, identified by TASK_MAGIC_PREFIX):
+         Deserializes and executes the function; sends back a result payload.
+      2. Plain-text "PING"        -> responds "PONG" (health-check).
+      3. Any other text           -> responds with an error message.
+
     Args:
         loop: The active asyncio event loop.
         sock: The active non-blocking UDP socket.
         data: Raw received payload bytes.
         addr: Tuple of (client_ip, client_port).
     """
+    # --- Route 1: MeshWeaver task packet (binary, starts with TASK_MAGIC_PREFIX) ---
+    if is_task_payload(data):
+        print(f"[Server] Received task payload from {addr} ({len(data)} bytes)")
+        try:
+            result_bytes = execute_task(data)
+            await loop.sock_sendto(sock, result_bytes, addr)
+            print(f"[Server] Sent task result to {addr} ({len(result_bytes)} bytes)")
+        except OSError as send_err:
+            print(f"[Server] Failed to send task result to {addr}: {send_err}")
+        return
+
+    # --- Route 2 & 3: Plain-text messages ---
     try:
         # Decode received bytes to string
         message = data.decode("utf-8").strip()

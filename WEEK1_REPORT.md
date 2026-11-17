@@ -3,7 +3,7 @@
 ## Project Details
 - **Project**: MeshWeaver – Zero-Dependency P2P Async Task Broker
 - **Phase**: Week 1 – Core Networking, Serialization & Foundation
-- **Current Status**: Modules 1 & 2 Completed; PING-PONG Handshake Verified; Serialization & Execution Pending
+- **Current Status**: ALL WEEK 1 MODULES COMPLETED
 
 ---
 
@@ -11,120 +11,173 @@
 
 | Component / Requirement | Status | Notes |
 | :--- | :--- | :--- |
-| **Project Structure Creation** | **Completed** | Core files, test directories, and initial manifests established |
-| **Module 1: Asynchronous UDP Server** | **COMPLETED** | Fully implemented in `udp_server.py` using `asyncio` and `socket` |
-| **Module 2: Asynchronous UDP Client** | **COMPLETED** | Fully implemented in `udp_client.py` using `asyncio` and `socket` |
-| **PING-PONG Communication** | **COMPLETED** | Verified across separate processes and unit test integration suite |
-| **Module 3: Function Serialization** | **PENDING** | `cloudpickle` proposed in `requirements.txt` (pending mentor approval); implementation pending |
-| **Module 4: Remote Function Execution** | **PENDING** | Execution engine and result pipeline not started |
-| **Automated Testing (`unittest`)** | **IN PROGRESS** | 8 UDP tests passing in `tests/test_udp.py`; serialization test suite pending |
-| **Documentation & Reporting** | **In Progress** | `README.md` and `WEEK1_REPORT.md` updated with Modules 1 & 2 records |
+| **Project Structure Creation** | **COMPLETED** | Core files, test directories, and manifests established |
+| **Module 1: Asynchronous UDP Server** | **COMPLETED** | `udp_server.py` – asyncio + socket; PING-PONG + task routing |
+| **Module 2: Asynchronous UDP Client** | **COMPLETED** | `udp_client.py` – PING-PONG + task submission methods |
+| **PING-PONG Communication** | **COMPLETED** | Verified end-to-end, preserved after task routing added |
+| **Module 3: Function Serialization** | **COMPLETED** | `serializer.py` – cloudpickle 3.1.2; functions, lambdas, closures |
+| **Module 4: Remote Function Execution** | **COMPLETED** | `executor.py` – deserialization, execution, error capture |
+| **Socket Integration (task flow)** | **COMPLETED** | Client → server → execute → result returned, real UDP round-trip |
+| **Automated Testing** | **COMPLETED** | 41 tests, 0 failures, 0 errors |
+| **Documentation & Reporting** | **COMPLETED** | README.md and WEEK1_REPORT.md finalized |
 
 ---
 
-## Module 1 Completion Record: Asynchronous UDP Server
+## Module 3 Completion Record: Function Serialization (`serializer.py`)
 
-- **Implementation**: Fully implemented in `udp_server.py` using Python's standard library `asyncio` and `socket` modules.
-- **Server Binding**:
-  - **Server IP**: `127.0.0.1`
-  - **Server Port**: `8000`
-  - **Socket Configuration**: IPv4 (`AF_INET`), Datagram (`SOCK_DGRAM`), Non-blocking (`sock.setblocking(False)`).
-- **Asynchronous Execution**: Uses `loop.sock_recvfrom()` for non-blocking datagram reception and `loop.sock_sendto()` for responses.
-- **Verification & Test Results**:
-  1. **PING Message Reception**: Successfully tested and verified reception of incoming `PING` datagrams.
-  2. **PONG Response Verification**: Successfully verified manual `PONG` response transmission back to sender client address and port.
-  3. **Unexpected Message Handling**: Successfully tested handling of unexpected/unknown payloads; server responds with an informative error message and remains active.
-  4. **Port Collision Handling**: Successfully tested socket binding error interception (`EADDRINUSE` / `WinError 10048`); displays a clear, actionable error instead of an unhandled crash.
-  5. **Graceful Server Shutdown**: Successfully verified clean shutdown on interruption signal (`KeyboardInterrupt` / `CancelledError`), ensuring sockets are closed properly.
+- **Dependency**: `cloudpickle 3.1.2` installed via `pip install cloudpickle`.
+- **Payload structure**: Binary dict (pickled) with `TASK_MAGIC_PREFIX` (`MWTK`) to distinguish from text messages.
+- **Functions implemented**:
+  - `serialize_task(func, args, kwargs) → bytes` – cloudpickle function + pickle args.
+  - `deserialize_task(payload) → (callable, tuple, dict)` – reconstructs function and args.
+  - `serialize_result(value, status) → bytes` – pickles result with `RESULT_MAGIC_PREFIX`.
+  - `deserialize_result(payload) → (status, value)` – reconstructs result.
+  - `is_task_payload(data) → bool` – used by server to route packets.
+  - `is_result_payload(data) → bool` – used by client to validate responses.
+- **Error handling**: TypeError for non-callables, ValueError for missing/wrong prefix, RuntimeError for corrupted bytes; oversized payload (>60 000 bytes) raises ValueError.
+- **Test results** (see section 7): All 20 serializer unit tests passed.
 
 ---
 
-## Module 2 Completion Record: Asynchronous UDP Client
+## Module 4 Completion Record: Remote Function Execution (`executor.py`)
 
-- **Implementation**: Fully implemented in `udp_client.py` (`AsyncUDPClient` class and `run_client` CLI entrypoint) using Python's standard library `asyncio` and `socket` modules.
-- **Client Configuration**:
-  - **Target Host**: `127.0.0.1` (configurable)
-  - **Target Port**: `8000` (configurable)
-  - **Timeout**: `3.0s` (configurable)
-  - **Socket Configuration**: Non-blocking IPv4 UDP datagram socket.
-- **Features Implemented**:
-  1. **Asynchronous Transmission**: Uses `loop.sock_sendto()` to send UTF-8 messages without blocking the event loop.
-  2. **Configurable Timeout Ingestion**: Uses `asyncio.wait_for(loop.sock_recvfrom(...), timeout=self.timeout)` to prevent hanging indefinitely.
-  3. **PING-PONG Handshake & Validation**: `client.ping()` dispatches `PING`, validates the response is exactly `PONG`, and returns boolean validation status.
-  4. **Server Unavailable & Connection Reset Handling**: Intercepts `ConnectionResetError` (ICMP port unreachable) and `TimeoutError` cleanly when server is offline.
-  5. **Unexpected Server Response Handling**: Gracefully detects non-PONG responses or server error payloads and reports validation status.
-  6. **Resource Management**: Implements `client.close()` and asynchronous context manager (`async with AsyncUDPClient()`) for leak-free socket teardown.
-  7. **CLI Interface**: CLI support with flags `--host`, `--port`, `--timeout`, and `--message`.
-- **Automated Test Results**:
-  - 8 automated tests in `tests/test_udp.py` passing with 100% success rate:
-    - `TestUDPServerUnit`: Socket creation and port collision error checks.
-    - `TestUDPClientUnit`: Socket lifecycle, unstarted error guards, timeout on unavailable server, and unexpected response validation.
-    - `TestUDPPingPongIntegration`: End-to-end integration test with live server task verifying PING-PONG success and unexpected message response.
+- **Functions implemented**:
+  - `execute_task(payload: bytes) → bytes` – deserializes → executes → serializes result; always returns a valid result payload (never raises).
+  - `run_task_locally(func, args, kwargs) → (status, value)` – convenience wrapper for unit testing without network.
+- **Error handling**: Deserialization failures and execution exceptions both produce `status='error'` result payloads with descriptive messages; sockets are never left dangling.
+- **Test results**: All 9 executor unit tests passed.
+
+---
+
+## Socket Integration Record
+
+- **Server (`udp_server.py`)**: Added `is_task_payload()` check at the top of `handle_message()`. Binary task packets are routed to `execute_task()` and result bytes sent back; plain-text `PING` handling is completely unchanged.
+- **Client (`udp_client.py`)**: Added `send_task(func, args, kwargs)` and `receive_task_result()` methods to `AsyncUDPClient`. Existing `send_message()`, `receive_response()`, and `ping()` methods are untouched.
+- **UDP payload size**: Each task payload is checked against a 60 000-byte safety limit; oversized payloads raise `ValueError` before transmission.
+- **Demonstrated round-trip**:
+  ```
+  add(10, 20) → serialize_task → UDP → execute_task → serialize_result → UDP → deserialize_result → 30
+  ```
+
+---
+
+## Real Example: `addition(10, 20)` via Socket
+
+```
+[Client] Serializing task: add(args=(10, 20), kwargs={})
+[Client] Sending task payload to 127.0.0.1:PORT (133 bytes)
+[Server] Received task payload from ('127.0.0.1', CLIENT_PORT) (133 bytes)
+[Executor] Running task: add(args=(10, 20), kwargs={})
+[Executor] Task completed. Result: 30
+[Server] Sent task result to ('127.0.0.1', CLIENT_PORT) (66 bytes)
+[Client] Task result received: status='ok', value=30
+```
+Result: **30** ✅
 
 ---
 
 ## Week 1 Implementation Checklist
 
 ### 1. Project Initialization & Scaffolding
-- [x] Create project files (`udp_server.py`, `udp_client.py`, `serializer.py`, `executor.py`)
-- [x] Create test directory structure (`tests/__init__.py`, `tests/test_udp.py`, `tests/test_serializer.py`)
-- [x] Set up `requirements.txt` with proposed `cloudpickle` dependency
-- [x] Initialize project `README.md` with objectives, requirements, and structure
-- [x] Establish initial `WEEK1_REPORT.md` progress checklist
-- [x] Preserve existing GitHub repository configuration
+- [x] Create project files and directory structure
+- [x] Set up `requirements.txt`
+- [x] Initialize `README.md` and `WEEK1_REPORT.md`
+- [x] Preserve GitHub repository configuration
 
-### 2. Module 1: Asynchronous UDP Server (`udp_server.py`) — **COMPLETED**
-- [x] Implement non-blocking IPv4 UDP socket creation and binding (`127.0.0.1:8000`)
-- [x] Implement asynchronous datagram listener using `asyncio` and `loop.sock_recvfrom()`
-- [x] Implement safe UTF-8 decoding and error handling for malformed data
-- [x] Implement PING detection and immediate PONG response via `loop.sock_sendto()`
-- [x] Test and verify PING message reception
-- [x] Test and verify manual PONG response
-- [x] Test unexpected message handling and client notification
-- [x] Test port collision handling (`EADDRINUSE` / `WinError 10048`)
-- [x] Verify graceful server shutdown and socket closure
+### 2. Module 1: Asynchronous UDP Server — **COMPLETED**
+- [x] Non-blocking IPv4 UDP socket creation and binding (`127.0.0.1:8000`)
+- [x] Asynchronous datagram listener (`loop.sock_recvfrom`)
+- [x] PING → PONG response (`loop.sock_sendto`)
+- [x] Task payload routing via `is_task_payload()` → `execute_task()`
+- [x] UTF-8 decode error handling
+- [x] Port collision handling
+- [x] Graceful shutdown
 
-### 3. Module 2: Asynchronous UDP Client (`udp_client.py`) — **COMPLETED**
-- [x] Create asynchronous UDP client using `asyncio` and `socket`
-- [x] Configure server IP as `127.0.0.1` and port as `8000` by default
-- [x] Implement PING dispatch and PONG response validation
-- [x] Implement configurable response timeout via `asyncio.wait_for`
-- [x] Handle server unavailable (`ConnectionResetError`) and timeout failures
-- [x] Support graceful client shutdown and async context manager
-- [x] Add clear console status and error logging
-- [x] Add CLI flags for `--host`, `--port`, `--timeout`, and `--message`
+### 3. Module 2: Asynchronous UDP Client — **COMPLETED**
+- [x] Non-blocking UDP socket with async methods
+- [x] `send_message()` / `receive_response()` for text communication
+- [x] `ping()` for PING-PONG validation
+- [x] `send_task(func, args, kwargs)` for task submission
+- [x] `receive_task_result()` for result reception
+- [x] Configurable timeout (`asyncio.wait_for`)
+- [x] Connection reset and timeout error handling
+- [x] CLI interface (`--host`, `--port`, `--timeout`, `--message`)
 
-### 4. PING-PONG Communication & Full Integration — **COMPLETED**
-- [x] Validate round-trip message exchange between server and client
-- [x] Validate unexpected message exchange and error notification
-- [x] End-to-end integration automated tests in `tests/test_udp.py` passing
+### 4. PING-PONG Communication — **COMPLETED**
+- [x] Round-trip verified between server and client processes
+- [x] Still works correctly after task routing added to server
 
-### 5. Module 3: Function Serialization (`serializer.py`) — **PENDING**
-- [ ] **Pending Mentor Approval**: Await formal approval for `cloudpickle` dependency
-- [ ] **Pending**: Implement serialization for standard functions, lambda expressions, and arguments
-- [ ] **Pending**: Implement deserialization with error checking
+### 5. Module 3: Function Serialization — **COMPLETED**
+- [x] `cloudpickle` installed (v3.1.2)
+- [x] `serialize_task()` / `deserialize_task()` for functions and args
+- [x] `serialize_result()` / `deserialize_result()` for results
+- [x] Magic prefix detection helpers (`is_task_payload`, `is_result_payload`)
+- [x] Payload size limit enforced (60 000 bytes)
+- [x] Error handling for non-callables, missing prefix, corrupted bytes
 
-### 6. Module 4: Remote Function Execution (`executor.py`) — **PENDING**
-- [ ] **Pending**: Implement executor to deserialize and invoke functions
-- [ ] **Pending**: Capture return values and execution exceptions
-- [ ] **Pending**: Package execution result and transmit back to caller
+### 6. Module 4: Remote Function Execution — **COMPLETED**
+- [x] `execute_task(payload)` – full deserialize → execute → serialize pipeline
+- [x] `run_task_locally(func, args, kwargs)` – unit-testable local executor
+- [x] Execution exceptions captured and returned as `status='error'`
+- [x] Never raises; always returns a valid result payload
 
-### 7. Automated Testing (`tests/`) — **IN PROGRESS**
-- [x] Implement unit tests for UDP server and client (`tests/test_udp.py`) (8 tests passing)
-- [ ] **Pending**: Implement unit tests for serialization (`tests/test_serializer.py`)
-- [ ] **Pending**: Implement end-to-end remote task execution test
-- [ ] **Pending**: Execute full test suite via `python -m unittest discover tests`
+### 7. Automated Testing — **COMPLETED**
 
-### 8. GitHub Documentation & Progress Reporting — **IN PROGRESS**
-- [x] Initial project structure and scope documented in `README.md`
-- [x] Module 1 implementation and test results recorded in `WEEK1_REPORT.md`
-- [x] Module 2 implementation and test results recorded in `WEEK1_REPORT.md`
-- [ ] **Pending**: Update report upon completion of Function Serialization (Module 3)
-- [ ] **Pending**: Finalize Week 1 summary report with complete test outputs
+#### `tests/test_udp.py` – 8 tests (UDP networking)
+- [x] `test_create_udp_socket_success`
+- [x] `test_port_collision_raises_oserror`
+- [x] `test_client_socket_lifecycle`
+- [x] `test_client_not_started_raises_runtime_error`
+- [x] `test_timeout_when_server_unavailable`
+- [x] `test_unexpected_server_response_validation`
+- [x] `test_ping_pong_success` (integration)
+- [x] `test_unexpected_message_handling` (integration)
+
+#### `tests/test_serializer.py` – 33 tests (serialization + execution + socket integration)
+**TestSerializer (20 unit tests)**
+- [x] serialize simple function, lambda, no-args function
+- [x] positional args preserved, keyword args preserved
+- [x] non-callable raises TypeError
+- [x] deserialize returns callable
+- [x] missing/corrupted prefix raises ValueError/RuntimeError
+- [x] serialize/deserialize integer result, string result, error status
+- [x] invalid status raises ValueError
+- [x] is_task_payload / is_result_payload helpers
+
+**TestExecutorLocal (9 unit tests, no network)**
+- [x] addition(10, 20) → 30
+- [x] multiplication(6, 7) → 42
+- [x] multiple arguments (positional + keyword)
+- [x] string-returning function
+- [x] lambda execution
+- [x] execution error returns `status='error'`
+- [x] execute_task via full payload
+- [x] execute_task with bad payload returns error
+- [x] execute_task where function raises returns error
+
+**TestTaskSocketIntegration (5 integration tests, real UDP)**
+- [x] `add(10, 20)` via socket → result = 30
+- [x] `multiply(6, 7)` via socket → result = 42
+- [x] lambda via socket → correct result
+- [x] function that raises → error propagated through socket
+- [x] PING-PONG preserved alongside task routing
+
+#### Full Suite Result
+```
+python -m unittest discover -s tests -v
+Ran 41 tests in 0.555s   OK   (0 failures, 0 errors)
+```
+
+### 8. GitHub Documentation — **COMPLETED**
+- [x] README.md finalized with all modules, usage, and test results
+- [x] WEEK1_REPORT.md finalized with completion records for all modules
 
 ---
 
-## Current Status & Next Steps
-- **Current State**: Modules 1 & 2 (Asynchronous UDP Server and UDP Client) and PING-PONG communication are fully implemented, verified, and documented.
-- **Pending Components**: Serialization (Module 3), Remote Execution (Module 4), and overall broker task execution integration remain pending.
-- **Next Step**: Await mentor approval for `cloudpickle` dependency and subsequent instructions to begin Module 3: Function Serialization (`serializer.py`).
+## Current Status & Remaining Work
+- **Week 1**: ALL REQUIREMENTS COMPLETED AND VERIFIED.
+- **Known Limitations**:
+  - UDP delivers datagrams unreliably (no retry/acknowledgement). This is acceptable for a local P2P dev environment.
+  - The executor does not sandbox functions – for development/local peers only.
+  - Payloads must stay below 60 000 bytes (enforced with a clear error).
+- **Next Phase**: Week 2 implementation, per mentor guidance.

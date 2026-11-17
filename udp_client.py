@@ -6,6 +6,11 @@ This module implements an asynchronous UDP client using Python's built-in
 `socket` and `asyncio` modules. It provides capabilities to dispatch datagrams,
 await server responses with a configurable timeout, validate PING-PONG round trips,
 handle network anomalies and timeouts gracefully, and ensure proper resource cleanup.
+
+Week 1 Module 3/4 extension:
+  Added send_task() and receive_task_result() methods to allow the client to
+  submit serialized function payloads and receive their execution results from
+  the server. All existing PING-PONG functionality is fully preserved.
 """
 
 from __future__ import annotations
@@ -14,7 +19,13 @@ import argparse
 import asyncio
 import socket
 import sys
-from typing import Tuple, Optional
+from typing import Any, Callable, Dict, Tuple, Optional
+
+from serializer import (
+    deserialize_result,
+    is_result_payload,
+    serialize_task,
+)
 
 # Default Client Configuration
 DEFAULT_SERVER_HOST: str = "127.0.0.1"
@@ -148,6 +159,107 @@ class AsyncUDPClient:
         except OSError as err:
             print(f"[Client Error] Socket error during receive: {err}")
             raise
+
+    async def send_task(
+        self,
+        func: Callable,
+        args: Tuple = (),
+        kwargs: Dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Serialize a Python function and its arguments, then transmit the
+        resulting task payload to the server via UDP.
+
+        Uses serializer.serialize_task() which produces a binary payload
+        with a MeshWeaver TASK_MAGIC_PREFIX so the server can distinguish
+        it from plain-text PING health checks.
+
+        Args:
+            func:   Any Python callable (function, lambda, closure).
+            args:   Positional arguments.
+            kwargs: Keyword arguments.
+
+        Raises:
+            RuntimeError: If the socket is not initialized.
+            ValueError:   If the payload exceeds the UDP size limit.
+            OSError:      If transmission fails.
+        """
+        if not self._is_open or not self.sock:
+            raise RuntimeError("Client socket is not open. Call start() before sending.")
+
+        if kwargs is None:
+            kwargs = {}
+
+        func_name = getattr(func, "__name__", repr(func))
+        print(f"[Client] Serializing task: {func_name}(args={args}, kwargs={kwargs})")
+
+        try:
+            payload = serialize_task(func, args=args, kwargs=kwargs)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            print(f"[Client Error] Task serialization failed: {exc}")
+            raise
+
+        print(f"[Client] Sending task payload to {self.server_host}:{self.server_port} ({len(payload)} bytes)")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.sock_sendto(self.sock, payload, (self.server_host, self.server_port))
+        except OSError as err:
+            print(f"[Client Error] Failed to send task payload: {err}")
+            raise
+
+    async def receive_task_result(self) -> Tuple[str, Any]:
+        """
+        Receive and deserialize a task result payload from the server.
+
+        Awaits a datagram from the server within the configured timeout,
+        validates that it carries a MeshWeaver RESULT_MAGIC_PREFIX, and
+        deserializes the status and return value.
+
+        Returns:
+            Tuple[str, Any]: (status, value) where status is 'ok' or 'error'
+                             and value is the function's return value or an
+                             error description string.
+
+        Raises:
+            RuntimeError: If the socket is not open, or the response is not a
+                          valid MeshWeaver result payload.
+            TimeoutError: If no response arrives within the configured timeout.
+        """
+        if not self._is_open or not self.sock:
+            raise RuntimeError("Client socket is not open. Call start() before receiving.")
+
+        loop = asyncio.get_running_loop()
+        try:
+            raw, addr = await asyncio.wait_for(
+                loop.sock_recvfrom(self.sock, BUFFER_SIZE),
+                timeout=self.timeout,
+            )
+        except asyncio.TimeoutError:
+            print(f"[Client Error] Task result timed out after {self.timeout}s")
+            raise TimeoutError(
+                f"No result received from {self.server_host}:{self.server_port} within {self.timeout}s."
+            )
+        except ConnectionResetError as exc:
+            print(f"[Client Error] Connection reset waiting for task result.")
+            raise exc
+
+        if not is_result_payload(raw):
+            # Could be a plain-text error from the server
+            try:
+                plain_text = raw.decode("utf-8")
+                raise RuntimeError(
+                    f"Server returned a plain-text response instead of a result payload: {plain_text!r}"
+                )
+            except UnicodeDecodeError:
+                raise RuntimeError("Server returned an unrecognized binary response (not a result payload).")
+
+        try:
+            status, value = deserialize_result(raw)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to deserialize task result: {exc}") from exc
+
+        print(f"[Client] Task result received from {addr}: status={status!r}, value={value!r}")
+        return status, value
 
     async def ping(self) -> bool:
         """
