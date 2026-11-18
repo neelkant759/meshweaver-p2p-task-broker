@@ -24,6 +24,7 @@ from typing import Tuple
 
 from executor import execute_task
 from serializer import is_task_payload
+from dht import DHTNode, is_dht_payload
 
 # Default Server Configuration
 DEFAULT_HOST: str = "127.0.0.1"
@@ -69,23 +70,38 @@ async def handle_message(
     sock: socket.socket,
     data: bytes,
     addr: Tuple[str, int],
+    dht_node: DHTNode | None = None,
 ) -> None:
     """
     Processes a received datagram and dispatches the appropriate response.
 
-    Handles three classes of incoming message:
-      1. MeshWeaver task payload  (binary, identified by TASK_MAGIC_PREFIX):
+    Handles four classes of incoming message:
+      1. MeshWeaver DHT discovery message (starts with MWDHT:):
+         Processes Kademlia peer discovery and returns DHT responses.
+      2. MeshWeaver task payload (binary, identified by TASK_MAGIC_PREFIX):
          Deserializes and executes the function; sends back a result payload.
-      2. Plain-text "PING"        -> responds "PONG" (health-check).
-      3. Any other text           -> responds with an error message.
+      3. Plain-text "PING" -> responds "PONG" (health-check).
+      4. Any other text -> responds with an error message.
 
     Args:
         loop: The active asyncio event loop.
         sock: The active non-blocking UDP socket.
         data: Raw received payload bytes.
         addr: Tuple of (client_ip, client_port).
+        dht_node: Optional active DHTNode controller instance for peer discovery.
     """
-    # --- Route 1: MeshWeaver task packet (binary, starts with TASK_MAGIC_PREFIX) ---
+    # --- Route 1: Kademlia DHT Discovery Message ---
+    if is_dht_payload(data):
+        if dht_node:
+            resp_bytes = dht_node.handle_dht_message(data, addr)
+            if resp_bytes:
+                try:
+                    await loop.sock_sendto(sock, resp_bytes, addr)
+                except OSError as send_err:
+                    print(f"[Server] Failed to send DHT response to {addr}: {send_err}")
+        return
+
+    # --- Route 2: MeshWeaver task packet (binary, starts with TASK_MAGIC_PREFIX) ---
     if is_task_payload(data):
         print(f"[Server] Received task payload from {addr} ({len(data)} bytes)")
         try:
@@ -129,7 +145,11 @@ async def handle_message(
             print(f"Failed to send response to {addr}: {send_err}")
 
 
-async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+async def run_server(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    dht_node: DHTNode | None = None,
+) -> None:
     """
     Runs the asynchronous UDP server event loop.
 
@@ -139,6 +159,7 @@ async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None
     Args:
         host: IP address to bind.
         port: Port number to bind.
+        dht_node: Optional active DHTNode controller instance.
     """
     sock: socket.socket | None = None
     try:
@@ -151,6 +172,8 @@ async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None
     print("\nMeshWeaver UDP Server Started")
     print(f"Server IP: {host}")
     print(f"Server Port: {port}")
+    if dht_node:
+        print(f"DHT Node ID: {dht_node.node_id.to_hex()}")
     print("Waiting for incoming messages...\n", flush=True)
 
     try:
@@ -158,7 +181,7 @@ async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None
             try:
                 # Asynchronously wait for incoming datagram
                 data, addr = await loop.sock_recvfrom(sock, BUFFER_SIZE)
-                await handle_message(loop, sock, data, addr)
+                await handle_message(loop, sock, data, addr, dht_node=dht_node)
             except asyncio.CancelledError:
                 # Raised when the server task is cancelled during shutdown
                 break
