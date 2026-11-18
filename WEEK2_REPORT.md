@@ -2,8 +2,8 @@
 
 ## Project Details
 - **Project**: MeshWeaver – Zero-Dependency P2P Async Task Broker
-- **Phase**: Week 2 – Decentralized Peer Discovery (Kademlia DHT)
-- **Current Status**: Kademlia DHT & Decentralized Peer Discovery Implemented and Verified
+- **Phase**: Week 2 – Decentralized Peer Discovery (Kademlia DHT) & Gossip Protocol
+- **Current Status**: Kademlia DHT & Gossip Protocol Implemented, Hardened, and Verified
 
 ---
 
@@ -11,41 +11,34 @@
 
 | Component / Requirement | Status | Notes |
 | :--- | :--- | :--- |
-| **Node ID Generation & Metric** | **COMPLETED** | 160-bit SHA-1 / random NodeID with bitwise XOR metric in `dht.py` |
-| **Peer Information Management** | **COMPLETED** | `Peer` dataclass tracking Node ID, IP, Port, and last seen timestamp |
-| **K-Bucket & Routing Table** | **COMPLETED** | 160 distance buckets with $k=8$ capacity and least-recently-seen updates |
+| **Node ID Generation & Metric** | **COMPLETED** | 160-bit SHA-1 / random NodeID with XOR metric and strict type guards |
+| **Peer Information Management** | **COMPLETED** | `Peer` dataclass with port boundary validation (1–65535) and lowercase normalization |
+| **K-Bucket & Routing Table** | **COMPLETED** | 160 distance buckets, $k=8$, least-recently-seen updates, case-insensitive self-exclusion |
 | **Kademlia RPC Protocol** | **COMPLETED** | Magic-prefixed JSON messaging (`DHT_PING`, `DHT_PONG`, `FIND_NODE`, `NODES_FOUND`) |
-| **Dynamic Node Bootstrap** | **COMPLETED** | `DHTNode.bootstrap()` queries bootstrap peers and dynamically expands network |
-| **Backward Compatibility** | **COMPLETED** | Preserved Week 1 text PING-PONG and binary task execution (`MWTK`/`MWRS`) |
-| **Automated Testing** | **COMPLETED** | 12 new DHT tests (53 tests total across full suite, 100% pass rate) |
+| **Dynamic Node Bootstrap** | **COMPLETED** | `DHTNode.bootstrap()` with multi-hop iterative neighbor discovery |
+| **CPU & RAM Telemetry Monitoring** | **COMPLETED** | Native zero-dependency monitoring via Windows ctypes, Linux `/proc`, and optional psutil |
+| **Gossip Protocol Framing** | **COMPLETED** | Magic-prefixed JSON envelopes (`MWGOSSIP:`) with sender listening address and resource stats |
+| **Asynchronous Background Dissemination**| **COMPLETED** | Periodic async heartbeat loop (5.0s default, configurable) spreading state across peers |
+| **Epidemic Discovery & Task Selection** | **COMPLETED** | Transitive neighbor discovery and `find_least_loaded_peer()` for decentralized scheduling |
+| **Backward Compatibility** | **COMPLETED** | Week 1 text PING-PONG, binary task execution (`MWTK`/`MWRS`), and DHT preserved |
+| **Automated Testing** | **COMPLETED** | 74 tests total across full suite, 100% pass rate in 3.0s |
 
 ---
 
-## Technical Implementation Details
+## Technical Hardening & Quality Improvements
 
-### 1. 160-Bit NodeID & XOR Distance Metric (`dht.py`)
-- Nodes have a 160-bit identifier (`NodeID`) randomly generated or derived via `hashlib.sha1`.
-- Implements standard Kademlia XOR metric: $d(x, y) = x \oplus y$.
-- Provides hex string conversions (`to_hex()`) and byte representations (`to_bytes()`).
+### 1. Robust Type & Range Validation (`dht.py`)
+- **Distance Metric Type Guard**: Added explicit check in `NodeID.distance(other)` raising a descriptive `TypeError` if `other` is not a `NodeID`.
+- **Hex String Normalization**: Lowercase normalization applied across `NodeID` and `Peer` instantiation.
+- **Port Boundary Validation**: `Peer.__post_init__` enforces $1 \le \text{port} \le 65535$, preventing routing table poisoning with corrupt or negative ports.
+- **Case-Insensitive Self-Exclusion**: `RoutingTable.add_peer` verifies `peer.get_node_id() == self.local_node_id`, ensuring nodes never store themselves regardless of hex formatting.
+- **Listen Port Advertising**: `DHT_PING` and `FIND_NODE` payloads explicitly advertise the node's listening server port, eliminating ephemeral client port recording.
 
-### 2. Peer & Routing Table Management (`Peer`, `KBucket`, `RoutingTable`)
-- `Peer`: Tracks contact address, port, node identifier, and freshness timestamp.
-- `KBucket`: Fixed capacity $k$ (default 8). When new contact arrives:
-  - If peer exists: refresh timestamp and move to tail (most recently seen).
-  - If bucket not full: append peer.
-  - If full: retain existing active peers.
-- `RoutingTable`: 160 buckets covering distances $[2^i, 2^{i+1})$. Local node is excluded. `get_closest_peers(target_id, count=k)` sorts active peers by XOR distance to target.
-
-### 3. Asynchronous DHT RPC & Dynamic Bootstrap (`DHTNode`)
-- Server routing in `udp_server.py` dispatches datagrams prefixed with `MWDHT:` to `DHTNode.handle_dht_message()`.
-- RPC Messages:
-  - `DHT_PING` / `DHT_PONG`: Verifies peer availability and records peer contact.
-  - `FIND_NODE`: Requests the $k$ closest peers to a specified target NodeID.
-  - `NODES_FOUND`: Returns closest neighbor contacts.
-- Dynamic Bootstrap:
-  - A joining node contacts any single bootstrap peer `(ip, port)`.
-  - Sends `FIND_NODE` for its own `NodeID`.
-  - Discovers neighbors from the response and iteratively queries them, populating its routing table without any central server or database.
+### 2. Zero-Dependency Resource Telemetry & Gossip Synchronization (`gossip.py`)
+- **Native OS Probing**: Utilizes `ctypes.windll.kernel32.GlobalMemoryStatusEx` and `GetSystemTimes` on Windows, and `/proc/meminfo` and `/proc/stat` on Linux, falling back gracefully without requiring external wheels.
+- **Periodic Telemetry Loop**: `GossipEngine` runs an asynchronous background loop sending heartbeat packets to up to $F=3$ randomly sampled peers.
+- **Epidemic Neighbor Learning**: Gossip payloads include a sample of known neighbor addresses, propagating topology updates across disconnected partitions.
+- **Workload Profiling**: Tracks active peer telemetry records with 30-second stale pruning and offers `find_least_loaded_peer()` for task broker dispatching.
 
 ---
 
@@ -54,23 +47,31 @@
 ```
 Command: python -m unittest discover -s tests -v
 
-Ran 53 tests in 1.115s
+Ran 74 tests in 2.999s
 
-OK (53/53 passed, 0 failures, 0 errors, 0 skipped)
+OK (74/74 passed, 0 failures, 0 errors, 0 skipped)
 ```
 
-- **`tests/test_dht.py` (12 tests)**:
-  - `test_random_generation`: Random 160-bit ID generation.
-  - `test_deterministic_from_string`: SHA-1 deterministic ID derivation.
-  - `test_xor_distance_properties`: Identity, symmetry, positivity.
-  - `test_peer_serialization_roundtrip`: Peer dict conversion.
-  - `test_capacity_limit`: KBucket enforces capacity $k$.
-  - `test_update_existing_moves_to_tail`: Least-recently-seen semantics.
-  - `test_self_excluded`: Routing table excludes local node ID.
-  - `test_get_closest_peers_ordering`: XOR distance sorting.
-  - `test_pack_and_unpack`: DHT magic prefix envelope encoding.
-  - `test_dht_ping_pong_between_nodes`: Live UDP socket exchange.
-  - `test_find_node_rpc`: Live FIND_NODE neighbor retrieval.
-  - `test_dynamic_multi_node_bootstrap`: Decentralized 3-node bootstrap (Node C discovers Node A through Node B).
+- **`tests/test_gossip.py` (13 tests)**:
+  - `test_cpu_percent_range`: CPU utilization calculation returns valid percent in [0.0, 100.0].
+  - `test_ram_info_keys_and_values`: RAM metrics (total, used, free, percent) validation.
+  - `test_get_metrics_snapshot`: `NodeResourceMetrics` snapshot capture.
+  - `test_metrics_serialization_roundtrip`: JSON-safe telemetry dict conversions.
+  - `test_is_gossip_payload`: Prefix detection for `MWGOSSIP:`.
+  - `test_pack_and_unpack_gossip`: Envelope packing and unpacking validation.
+  - `test_unpack_invalid_payload_raises_value_error`: Corrupted / missing header rejection.
+  - `test_handle_gossip_updates_peer_and_metrics`: Ingestion of gossip updates routing table and telemetry.
+  - `test_handle_gossip_self_message_ignored`: Local node self-gossip drop.
+  - `test_handle_gossip_epidemic_neighbor_discovery`: Discovery of transitive peers advertised in gossip payload.
+  - `test_find_least_loaded_peer`: Optimal peer selection based on CPU load and free RAM.
+  - `test_live_two_node_gossip_telemetry_exchange`: End-to-end periodic UDP gossip telemetry exchange between 2 live nodes.
+  - `test_live_three_node_epidemic_discovery`: Decentralized 3-node epidemic propagation without direct bootstrap.
+- **`tests/test_dht.py` (20 tests)**: All 20 Kademlia DHT tests pass.
 - **`tests/test_udp.py` (8 tests)**: All Week 1 networking tests pass.
 - **`tests/test_serializer.py` (33 tests)**: All Week 1 serialization & execution tests pass.
+
+---
+
+## Current Status & Next Steps
+- **Current State**: Week 2 Decentralized Peer Discovery (Kademlia DHT) and Gossip Protocol & Resource Monitoring are fully implemented and verified with 74 passing tests.
+- **Next Phase (Week 3)**: Decentralized Task Scheduling & Broker (routing compute tasks to the least-loaded nodes, failover, and result collection).

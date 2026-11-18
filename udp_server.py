@@ -25,6 +25,7 @@ from typing import Tuple
 from executor import execute_task
 from serializer import is_task_payload
 from dht import DHTNode, is_dht_payload
+from gossip import GossipEngine, is_gossip_payload
 
 # Default Server Configuration
 DEFAULT_HOST: str = "127.0.0.1"
@@ -71,17 +72,20 @@ async def handle_message(
     data: bytes,
     addr: Tuple[str, int],
     dht_node: DHTNode | None = None,
+    gossip_engine: GossipEngine | None = None,
 ) -> None:
     """
     Processes a received datagram and dispatches the appropriate response.
 
-    Handles four classes of incoming message:
+    Handles five classes of incoming message:
       1. MeshWeaver DHT discovery message (starts with MWDHT:):
          Processes Kademlia peer discovery and returns DHT responses.
-      2. MeshWeaver task payload (binary, identified by TASK_MAGIC_PREFIX):
+      2. MeshWeaver Gossip message (starts with MWGOSSIP:):
+         Processes periodic telemetry (CPU/RAM) and gossip neighbor discovery.
+      3. MeshWeaver task payload (binary, identified by TASK_MAGIC_PREFIX):
          Deserializes and executes the function; sends back a result payload.
-      3. Plain-text "PING" -> responds "PONG" (health-check).
-      4. Any other text -> responds with an error message.
+      4. Plain-text "PING" -> responds "PONG" (health-check).
+      5. Any other text -> responds with an error message.
 
     Args:
         loop: The active asyncio event loop.
@@ -89,6 +93,7 @@ async def handle_message(
         data: Raw received payload bytes.
         addr: Tuple of (client_ip, client_port).
         dht_node: Optional active DHTNode controller instance for peer discovery.
+        gossip_engine: Optional active GossipEngine instance for telemetry synchronization.
     """
     # --- Route 1: Kademlia DHT Discovery Message ---
     if is_dht_payload(data):
@@ -101,7 +106,13 @@ async def handle_message(
                     print(f"[Server] Failed to send DHT response to {addr}: {send_err}")
         return
 
-    # --- Route 2: MeshWeaver task packet (binary, starts with TASK_MAGIC_PREFIX) ---
+    # --- Route 2: Gossip Telemetry Heartbeat ---
+    if is_gossip_payload(data):
+        if gossip_engine:
+            gossip_engine.handle_gossip(data, addr)
+        return
+
+    # --- Route 3: MeshWeaver task packet (binary, starts with TASK_MAGIC_PREFIX) ---
     if is_task_payload(data):
         print(f"[Server] Received task payload from {addr} ({len(data)} bytes)")
         try:
@@ -149,6 +160,7 @@ async def run_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     dht_node: DHTNode | None = None,
+    gossip_engine: GossipEngine | None = None,
 ) -> None:
     """
     Runs the asynchronous UDP server event loop.
@@ -160,6 +172,7 @@ async def run_server(
         host: IP address to bind.
         port: Port number to bind.
         dht_node: Optional active DHTNode controller instance.
+        gossip_engine: Optional active GossipEngine instance.
     """
     sock: socket.socket | None = None
     try:
@@ -174,6 +187,9 @@ async def run_server(
     print(f"Server Port: {port}")
     if dht_node:
         print(f"DHT Node ID: {dht_node.node_id.to_hex()}")
+    if gossip_engine:
+        print(f"Gossip Engine active (Interval: {gossip_engine.interval}s)")
+        gossip_engine.start(loop=loop, sock=sock)
     print("Waiting for incoming messages...\n", flush=True)
 
     try:
@@ -181,7 +197,11 @@ async def run_server(
             try:
                 # Asynchronously wait for incoming datagram
                 data, addr = await loop.sock_recvfrom(sock, BUFFER_SIZE)
-                await handle_message(loop, sock, data, addr, dht_node=dht_node)
+                if not data or not addr:
+                    continue
+                await handle_message(
+                    loop, sock, data, addr, dht_node=dht_node, gossip_engine=gossip_engine
+                )
             except asyncio.CancelledError:
                 # Raised when the server task is cancelled during shutdown
                 break
@@ -190,6 +210,8 @@ async def run_server(
                 print(f"[Warning] Socket communication error: {sock_err}")
                 await asyncio.sleep(0.05)
     finally:
+        if gossip_engine:
+            gossip_engine.stop()
         if sock:
             sock.close()
             print("\nSocket successfully closed.")

@@ -62,6 +62,22 @@ class TestNodeID(unittest.TestCase):
         # Positivity: d(a, b) > 0 for a != b
         self.assertGreater(id_a.distance(id_b), 0)
 
+    def test_invalid_inputs_and_type_guards(self):
+        id_a = NodeID.from_string("node_a")
+        # Distance with non-NodeID must raise TypeError
+        with self.assertRaises(TypeError):
+            id_a.distance("not_a_node_id")
+        with self.assertRaises(TypeError):
+            id_a.distance(12345)
+
+        # Invalid hex string must raise ValueError
+        with self.assertRaises(ValueError):
+            NodeID("not_a_valid_hex_string_zzzz")
+
+        # Negative int must raise ValueError
+        with self.assertRaises(ValueError):
+            NodeID(-100)
+
 
 class TestPeer(unittest.TestCase):
     """Unit tests for Peer dataclass."""
@@ -74,6 +90,21 @@ class TestPeer(unittest.TestCase):
         self.assertEqual(peer.ip, reconstructed.ip)
         self.assertEqual(peer.port, reconstructed.port)
         self.assertAlmostEqual(peer.last_seen, reconstructed.last_seen)
+
+    def test_invalid_port_raises_value_error(self):
+        """Verifies port boundary validation (1 <= port <= 65535)."""
+        with self.assertRaises(ValueError):
+            Peer(node_id="a" * 40, ip="127.0.0.1", port=0)
+        with self.assertRaises(ValueError):
+            Peer(node_id="a" * 40, ip="127.0.0.1", port=70000)
+        with self.assertRaises(ValueError):
+            Peer(node_id="a" * 40, ip="127.0.0.1", port=-80)
+
+    def test_node_id_normalized_to_lowercase(self):
+        """Verifies node IDs are normalized to lowercase on creation."""
+        upper_id = "ABCD" * 10
+        peer = Peer(node_id=upper_id, ip="127.0.0.1", port=8000)
+        self.assertEqual(peer.node_id, upper_id.lower())
 
 
 class TestKBucket(unittest.TestCase):
@@ -116,6 +147,30 @@ class TestRoutingTable(unittest.TestCase):
         # Adding self should return False and not store peer
         self.assertFalse(table.add_peer(self_peer))
         self.assertEqual(table.total_peers(), 0)
+
+    def test_self_exclusion_case_insensitive(self):
+        """Verifies that local node is excluded even if peer ID is uppercase."""
+        local_id = NodeID.from_string("local_node")
+        table = RoutingTable(local_id, k=5)
+        upper_self_peer = Peer(node_id=local_id.to_hex().upper(), ip="127.0.0.1", port=8000)
+        self.assertFalse(table.add_peer(upper_self_peer))
+        self.assertEqual(table.total_peers(), 0)
+
+    def test_duplicate_peer_handling(self):
+        """Verifies that re-adding existing peers does not duplicate entries."""
+        local_id = NodeID(0)
+        table = RoutingTable(local_id, k=5)
+        peer = Peer(node_id=f"{1:040x}", ip="127.0.0.1", port=8001)
+
+        # First add
+        self.assertTrue(table.add_peer(peer))
+        self.assertEqual(table.total_peers(), 1)
+
+        # Re-add same peer (e.g. updated port / refresh)
+        peer_updated = Peer(node_id=f"{1:040x}", ip="127.0.0.1", port=9001)
+        self.assertTrue(table.add_peer(peer_updated))
+        self.assertEqual(table.total_peers(), 1)
+        self.assertEqual(table.all_peers()[0].port, 9001)
 
     def test_get_closest_peers_ordering(self):
         local_id = NodeID(0)
@@ -237,6 +292,50 @@ class TestDHTIntegration(unittest.IsolatedAsyncioTestCase):
         c_known_ids = [p.node_id for p in node_c.routing_table.all_peers()]
         self.assertIn(node_b.node_id.to_hex(), c_known_ids)
         self.assertIn(node_a.node_id.to_hex(), c_known_ids)
+
+    async def test_bootstrap_failure_on_unavailable_node(self):
+        """Verifies bootstrap returns False when the target node is offline."""
+        unused_port = self._get_free_port()
+        local_node = DHTNode(port=self._get_free_port())
+        success = await local_node.bootstrap("127.0.0.1", unused_port, timeout=0.2)
+        self.assertFalse(success)
+        self.assertEqual(local_node.routing_table.total_peers(), 0)
+
+    async def test_network_communication_error_handling(self):
+        """Verifies ping_peer and find_node_rpc handle timeouts and errors cleanly."""
+        unused_port = self._get_free_port()
+        local_node = DHTNode(port=self._get_free_port())
+
+        # Ping to offline port must return False
+        ping_ok = await local_node.ping_peer("127.0.0.1", unused_port, timeout=0.2)
+        self.assertFalse(ping_ok)
+
+        # find_node_rpc to offline port must return empty list
+        peers = await local_node.find_node_rpc("127.0.0.1", unused_port, local_node.node_id, timeout=0.2)
+        self.assertEqual(peers, [])
+
+    async def test_four_node_mesh_topology_discovery(self):
+        """
+        Decentralized 4-node discovery chain:
+        A <- B <- C <- D
+        Node D bootstraps ONLY to C, but through iterative discovery
+        learns about C, B, and A.
+        """
+        node_a, port_a = await self._start_node()
+        node_b, port_b = await self._start_node()
+        node_c, port_c = await self._start_node()
+        node_d, port_d = await self._start_node()
+
+        # Chain bootstrapping
+        await node_b.bootstrap("127.0.0.1", port_a)
+        await node_c.bootstrap("127.0.0.1", port_b)
+        await node_d.bootstrap("127.0.0.1", port_c)
+
+        d_peers = [p.node_id for p in node_d.routing_table.all_peers()]
+        # Node D should have discovered Node C directly, and Node B + A through C
+        self.assertIn(node_c.node_id.to_hex(), d_peers)
+        self.assertIn(node_b.node_id.to_hex(), d_peers)
+        self.assertIn(node_a.node_id.to_hex(), d_peers)
 
 
 if __name__ == "__main__":

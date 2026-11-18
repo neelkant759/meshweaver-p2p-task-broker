@@ -46,14 +46,20 @@ class NodeID:
             raw = os.urandom(DHT_ID_BITS // 8)
             self.int_val: int = int.from_bytes(raw, byteorder="big")
         elif isinstance(value, int):
+            if value < 0:
+                raise ValueError("NodeID integer cannot be negative")
             self.int_val = value & ((1 << DHT_ID_BITS) - 1)
         elif isinstance(value, bytes):
             self.int_val = int.from_bytes(value[: DHT_ID_BITS // 8], byteorder="big")
         elif isinstance(value, str):
-            # Parse hex string
-            self.int_val = int(value, 16) & ((1 << DHT_ID_BITS) - 1)
+            # Parse hex string with case-insensitivity
+            cleaned = value.strip().lower()
+            try:
+                self.int_val = int(cleaned, 16) & ((1 << DHT_ID_BITS) - 1)
+            except ValueError as err:
+                raise ValueError(f"Invalid hexadecimal string for NodeID: {value!r}") from err
         else:
-            raise TypeError(f"Unsupported type for NodeID: {type(value)}")
+            raise TypeError(f"Unsupported type for NodeID: {type(value).__name__}")
 
     @classmethod
     def from_string(cls, text: str) -> NodeID:
@@ -63,6 +69,8 @@ class NodeID:
 
     def distance(self, other: NodeID) -> int:
         """Compute the Kademlia XOR metric distance: d(x, y) = x ^ y."""
+        if not isinstance(other, NodeID):
+            raise TypeError(f"Cannot compute distance to non-NodeID type: {type(other).__name__}")
         return self.int_val ^ other.int_val
 
     def to_hex(self) -> str:
@@ -96,17 +104,28 @@ class Peer:
     ip: str
     port: int
     last_seen: float = 0.0
+    resources: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        self.node_id = str(self.node_id).strip().lower()
+        if not (1 <= self.port <= 65535):
+            raise ValueError(f"Invalid port: {self.port}. Must be between 1 and 65535.")
+        if self.resources is None:
+            self.resources = {}
 
     def get_node_id(self) -> NodeID:
         return NodeID(self.node_id)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data: Dict[str, Any] = {
             "node_id": self.node_id,
             "ip": self.ip,
             "port": self.port,
             "last_seen": self.last_seen,
         }
+        if self.resources:
+            data["resources"] = self.resources
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> Peer:
@@ -115,6 +134,7 @@ class Peer:
             ip=str(data["ip"]),
             port=int(data["port"]),
             last_seen=float(data.get("last_seen", time.time())),
+            resources=data.get("resources", {}),
         )
 
 
@@ -182,7 +202,7 @@ class RoutingTable:
 
     def add_peer(self, peer: Peer) -> bool:
         """Add or refresh a peer in the appropriate bucket."""
-        if peer.node_id == self.local_node_id.to_hex():
+        if peer.get_node_id() == self.local_node_id:
             return False  # Do not add self to routing table
         idx = self._get_bucket_index(peer.get_node_id())
         return self.buckets[idx].add_or_update(peer)
@@ -280,11 +300,12 @@ class DHTNode:
         payload = msg.get("payload", {})
 
         # Automatically record or refresh sender peer in routing table
+        listen_port = int(payload.get("listen_port", sender_addr[1]))
         if sender_id and sender_id != self.node_id.to_hex():
             sender_peer = Peer(
                 node_id=sender_id,
                 ip=sender_addr[0],
-                port=sender_addr[1],
+                port=listen_port,
                 last_seen=time.time(),
             )
             self.routing_table.add_peer(sender_peer)
@@ -330,7 +351,7 @@ class DHTNode:
     ) -> bool:
         """Send a DHT_PING to a remote peer and await DHT_PONG."""
         loop = asyncio.get_running_loop()
-        query = pack_dht_message("DHT_PING", self.node_id.to_hex())
+        query = pack_dht_message("DHT_PING", self.node_id.to_hex(), {"listen_port": self.port})
 
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         client_sock.setblocking(False)
@@ -370,7 +391,7 @@ class DHTNode:
         query = pack_dht_message(
             "FIND_NODE",
             self.node_id.to_hex(),
-            {"target_id": target_id.to_hex()},
+            {"target_id": target_id.to_hex(), "listen_port": self.port},
         )
 
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
