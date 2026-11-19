@@ -122,20 +122,42 @@ Structured heartbeat packets identified by the `MWGOSSIP:` binary magic prefix:
 
 ---
 
+## Decentralized Task Scheduling & Intelligent Peer Selection (`router.py`)
+
+Week 3 introduces the decentralized task scheduling layer (`TaskRouter`) that uses real-time gossip telemetry to select the optimal peer across the P2P network:
+
+### 1. Multi-Metric Evaluation Hierarchy
+1. **Primary Metric (Lowest CPU)**: Peers are ranked by `cpu_percent` in ascending order, prioritizing available computational capacity.
+2. **Secondary Metric (Highest Free RAM)**: If multiple peers report identical CPU loads (e.g. idle nodes at 0.0%), ties are broken by `ram_free_mb` in descending order.
+3. **Tertiary Metric (Deterministic NodeID)**: If CPU and RAM metrics are both identical, deterministic alphabetical ordering of `node_id` guarantees consistent, jitter-free tie-breaking without central coordination.
+
+### 2. Stale Telemetry Pruning & Dynamic Exclusion
+- **Stale Record Invalidation**: Telemetry entries older than `stale_threshold` (default: 30.0s) are automatically ignored.
+- **Node Exclusion**: Supports `exclude_nodes` (case-insensitive) to omit specific peers (e.g., self or unresponsive nodes during failover).
+- **Error Handling**: Raises `NoPeerAvailableError` when no eligible, non-stale peers exist.
+
+### 3. Configurable Local Fallback
+When `fallback_to_local=True`, `schedule_task()` falls back to running the task locally on the host via `executor.run_task_locally()`, ensuring uninterrupted service when the node is isolated or the mesh is idle.
+
+---
+
 ## Dependencies
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 ```
 - **cloudpickle 3.1.2**: Function & lambda serialization.
-- **Kademlia DHT & Gossip Protocol**: 100% Zero-Dependency (built entirely with Python standard library: `ctypes`, `hashlib`, `json`, `asyncio`, `socket`, `time`, `dataclasses`).
+- **Core Engine (Networking, DHT, Gossip, Router)**: 100% Zero-Dependency (built entirely with Python standard library: `ctypes`, `hashlib`, `json`, `asyncio`, `socket`, `time`, `dataclasses`).
 
 ---
 
 ## Running Tests
 ```bash
-# Full test suite across all modules (74 tests)
+# Full test suite across all modules (88 tests)
 python -m unittest discover -s tests -v
+
+# Run Task Router & Peer Selection tests only (14 tests)
+python -m unittest tests/test_router.py -v
 
 # Run Gossip Protocol & Resource Monitoring tests only (13 tests)
 python -m unittest tests/test_gossip.py -v
@@ -154,5 +176,5 @@ python -m unittest tests/test_serializer.py -v
 
 ## Test Results
 ```
-Ran 74 tests in 2.999s   OK   (0 failures, 0 errors, 0 skipped)
+Ran 88 tests in 2.957s   OK   (0 failures, 0 errors, 0 skipped)
 ```
