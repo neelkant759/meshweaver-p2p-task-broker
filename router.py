@@ -13,17 +13,46 @@ distribution across the MeshWeaver P2P network:
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import asdict, dataclass
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+import uuid
 
 from dht import Peer
 from executor import run_task_locally
 from gossip import GossipEngine, NodeResourceMetrics, PeerTelemetry
+from udp_client import AsyncUDPClient
 
 
 class NoPeerAvailableError(Exception):
     """Raised when no active, non-stale peers are eligible for task scheduling."""
     pass
+
+
+@dataclass
+class TaskExecutionResponse:
+    """
+    Structured response object returned upon task execution.
+
+    Attributes:
+        task_id: Unique identifier for the submitted task.
+        status: Execution outcome status ('ok' or 'error').
+        result: The function return value on success, or error string / traceback.
+        executed_by: Endpoint of the node that executed the task ("ip:port" or "local").
+        target_node_id: 160-bit hex identifier of the executing peer (or None if local).
+        round_trip_ms: Total latency from task dispatch to result receipt in milliseconds.
+    """
+    task_id: str
+    status: str
+    result: Any
+    executed_by: str
+    target_node_id: Optional[str] = None
+    round_trip_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the response to a standard Python dictionary."""
+        return asdict(self)
 
 
 DEFAULT_STALE_THRESHOLD: float = 30.0
@@ -170,4 +199,106 @@ class TaskRouter:
         """Asynchronous wrapper for schedule_task."""
         return self.schedule_task(
             func, args=args, kwargs=kwargs, exclude_nodes=exclude_nodes, now=now
+        )
+
+    async def dispatch_task(
+        self,
+        func: Callable,
+        args: Tuple = (),
+        kwargs: Dict[str, Any] | None = None,
+        task_id: Optional[str] = None,
+        timeout: float = 5.0,
+        exclude_nodes: Optional[Set[str] | List[str]] = None,
+        now: Optional[float] = None,
+    ) -> TaskExecutionResponse:
+        """
+        Select an optimal peer via Gossip telemetry and dispatch the task remotely over UDP.
+
+        Workflow:
+        1. Generates a unique task_id if one is not provided.
+        2. Measures round_trip_ms using high-precision monotonic timing.
+        3. Selects the target peer using multi-criteria ranking (lowest CPU, highest RAM).
+           If no peer is available and fallback_to_local is True, executes locally.
+        4. Serializes and transmits the task payload over UDP via AsyncUDPClient.
+        5. Receives, deserializes, and formats the execution outcome into a TaskExecutionResponse.
+
+        Args:
+            func: The Python callable to execute remotely.
+            args: Positional arguments for the callable.
+            kwargs: Keyword arguments for the callable.
+            task_id: Optional unique identifier; auto-generated if omitted.
+            timeout: Maximum wait time in seconds for the remote node to return a result.
+            exclude_nodes: Node IDs to exclude from peer selection.
+            now: Optional reference timestamp for staleness filtering.
+
+        Returns:
+            TaskExecutionResponse: Complete execution record including task_id, status,
+                                   result, executed_by, target_node_id, and round_trip_ms.
+
+        Raises:
+            NoPeerAvailableError: If no eligible remote peers exist and fallback_to_local is False.
+            TimeoutError: If the remote peer fails to return a result within the timeout.
+            RuntimeError / OSError: On network or communication failures.
+        """
+        if task_id is None:
+            task_id = f"task_{uuid.uuid4().hex[:12]}"
+
+        if kwargs is None:
+            kwargs = {}
+
+        start_time = time.perf_counter()
+
+        # Step 1: Select peer with local fallback support
+        try:
+            peer, metrics = self.select_target_peer(exclude_nodes=exclude_nodes, now=now)
+        except NoPeerAvailableError:
+            if self.fallback_to_local:
+                status, val = run_task_locally(func, args=args, kwargs=kwargs)
+                duration_ms = (time.perf_counter() - start_time) * 1000.0
+                return TaskExecutionResponse(
+                    task_id=task_id,
+                    status=status,
+                    result=val,
+                    executed_by="local",
+                    target_node_id=None,
+                    round_trip_ms=round(duration_ms, 2),
+                )
+            raise
+
+        # Step 2: Remote dispatch via AsyncUDPClient
+        async with AsyncUDPClient(server_host=peer.ip, server_port=peer.port, timeout=timeout) as client:
+            await client.send_task(func, args=args, kwargs=kwargs)
+            status, val = await client.receive_task_result()
+
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        return TaskExecutionResponse(
+            task_id=task_id,
+            status=status,
+            result=val,
+            executed_by=f"{peer.ip}:{peer.port}",
+            target_node_id=peer.node_id,
+            round_trip_ms=round(duration_ms, 2),
+        )
+
+    def dispatch_task_sync(
+        self,
+        func: Callable,
+        args: Tuple = (),
+        kwargs: Dict[str, Any] | None = None,
+        task_id: Optional[str] = None,
+        timeout: float = 5.0,
+        exclude_nodes: Optional[Set[str] | List[str]] = None,
+        now: Optional[float] = None,
+    ) -> TaskExecutionResponse:
+        """Synchronous wrapper for dispatch_task."""
+        return asyncio.run(
+            self.dispatch_task(
+                func,
+                args=args,
+                kwargs=kwargs,
+                task_id=task_id,
+                timeout=timeout,
+                exclude_nodes=exclude_nodes,
+                now=now,
+            )
         )
