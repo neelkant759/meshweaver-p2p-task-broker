@@ -38,6 +38,7 @@ def execute_task(payload: bytes) -> bytes:
 
     This is the main entry point called by the server when it detects an
     incoming task packet (identified by the TASK_MAGIC_PREFIX).
+    Preserves task_id throughout execution and embeds it in the result payload.
 
     Args:
         payload: Raw bytes from the UDP socket containing a serialized task.
@@ -47,18 +48,18 @@ def execute_task(payload: bytes) -> bytes:
                transmitted back to the client via UDP.
 
     Behaviour:
-        - On success:  returns serialize_result(return_value, status="ok").
+        - On success:  returns serialize_result(return_value, status="ok", task_id=task_id).
         - On deserialization error: returns serialize_result(error_msg, status="error").
-        - On execution exception:   returns serialize_result(error_msg, status="error").
+        - On execution exception:   returns serialize_result(error_msg, status="error", task_id=task_id).
 
     Example (server handler):
         >>> if is_task_payload(data):
         ...     result_bytes = execute_task(data)
         ...     await loop.sock_sendto(sock, result_bytes, addr)
     """
-    # Step 1: Deserialize task payload
+    # Step 1: Deserialize task payload including task_id
     try:
-        func, args, kwargs = deserialize_task(payload)
+        func, args, kwargs, task_id = deserialize_task(payload, with_task_id=True)
     except (ValueError, RuntimeError) as exc:
         error_msg = f"[Executor] Task deserialization failed: {exc}"
         print(error_msg)
@@ -66,13 +67,14 @@ def execute_task(payload: bytes) -> bytes:
 
     # Step 2: Log what we are about to execute
     func_name = getattr(func, "__name__", repr(func))
-    print(f"[Executor] Running task: {func_name}(args={args}, kwargs={kwargs})")
+    task_label = f" [{task_id}]" if task_id else ""
+    print(f"[Executor] Running task{task_label}: {func_name}(args={args}, kwargs={kwargs})")
 
     # Step 3: Execute the function, capturing any exception
     try:
         result: Any = func(*args, **kwargs)
         print(f"[Executor] Task completed. Result: {result!r}")
-        return serialize_result(result, status="ok")
+        return serialize_result(result, status="ok", task_id=task_id)
     except Exception as exc:
         error_msg = (
             f"[Executor] Task execution raised an exception in '{func_name}': "
@@ -80,7 +82,7 @@ def execute_task(payload: bytes) -> bytes:
             f"{traceback.format_exc()}"
         )
         print(error_msg)
-        return serialize_result(error_msg, status="error")
+        return serialize_result(error_msg, status="error", task_id=task_id)
 
 
 def run_task_locally(

@@ -51,6 +51,7 @@ def serialize_task(
     func: Callable,
     args: Tuple = (),
     kwargs: Dict[str, Any] | None = None,
+    task_id: Optional[str] = None,
 ) -> bytes:
     """
     Serialize a callable and its arguments into a transmittable byte payload.
@@ -58,11 +59,13 @@ def serialize_task(
     The function is serialized with cloudpickle (supports lambdas, closures,
     locally-defined functions). The args/kwargs are also pickled separately
     so they can be unpacked independently on the receiver side.
+    An optional task_id is embedded in the envelope for response correlation.
 
     Args:
-        func:   Any Python callable (function, lambda, closure).
-        args:   Positional arguments to pass when executing the function.
-        kwargs: Keyword arguments to pass when executing the function.
+        func:    Any Python callable (function, lambda, closure).
+        args:    Positional arguments to pass when executing the function.
+        kwargs:  Keyword arguments to pass when executing the function.
+        task_id: Optional unique identifier for request/response correlation.
 
     Returns:
         bytes: Magic-prefixed serialized task payload.
@@ -74,7 +77,7 @@ def serialize_task(
 
     Example:
         >>> def add(x, y): return x + y
-        >>> payload = serialize_task(add, args=(10, 20))
+        >>> payload = serialize_task(add, args=(10, 20), task_id="task_123")
     """
     if not callable(func):
         raise TypeError(f"Expected a callable, got {type(func).__name__!r}.")
@@ -90,6 +93,7 @@ def serialize_task(
             # Standard pickle is fine for ordinary args/kwargs
             "args": pickle.dumps(args),
             "kwargs": pickle.dumps(kwargs),
+            "task_id": task_id,
         }
         raw: bytes = pickle.dumps(task_dict)
     except Exception as exc:
@@ -109,15 +113,20 @@ def serialize_task(
 
 def deserialize_task(
     payload: bytes,
-) -> Tuple[Callable, Tuple, Dict[str, Any]]:
+    with_task_id: bool = False,
+) -> Tuple:
     """
     Reconstruct a callable and its arguments from a received byte payload.
 
     Args:
-        payload: Raw bytes received from the UDP socket (may include magic prefix).
+        payload:      Raw bytes received from the UDP socket (may include magic prefix).
+        with_task_id: When True, returns a 4-tuple including task_id.
+                      When False (default), returns a 3-tuple (func, args, kwargs)
+                      to preserve complete backward compatibility.
 
     Returns:
-        Tuple of (callable, positional_args tuple, keyword_args dict).
+        Tuple of (callable, positional_args tuple, keyword_args dict) if with_task_id is False,
+        or Tuple of (callable, positional_args tuple, keyword_args dict, task_id) if with_task_id is True.
 
     Raises:
         ValueError:   If the payload is missing the magic prefix or is malformed.
@@ -125,7 +134,7 @@ def deserialize_task(
 
     Example:
         >>> func, args, kwargs = deserialize_task(payload)
-        >>> result = func(*args, **kwargs)
+        >>> func, args, kwargs, task_id = deserialize_task(payload, with_task_id=True)
     """
     if not isinstance(payload, (bytes, bytearray)):
         raise ValueError(f"Expected bytes payload, got {type(payload).__name__!r}.")
@@ -164,17 +173,26 @@ def deserialize_task(
     if not callable(func):
         raise ValueError("Deserialized function object is not callable.")
 
+    task_id: Optional[str] = task_dict.get("task_id")
+    if with_task_id:
+        return func, args, kwargs, task_id
     return func, args, kwargs
 
 
-def serialize_result(value: Any, *, status: str = "ok") -> bytes:
+def serialize_result(
+    value: Any,
+    *,
+    status: str = "ok",
+    task_id: Optional[str] = None,
+) -> bytes:
     """
     Serialize an execution result or error string for transmission back to the caller.
 
     Args:
-        value:  Return value from the executed function (any picklable object),
-                or an error description string when status == 'error'.
-        status: 'ok' for a successful result, 'error' for a failure description.
+        value:   Return value from the executed function (any picklable object),
+                 or an error description string when status == 'error'.
+        status:  'ok' for a successful result, 'error' for a failure description.
+        task_id: Unique task identifier to correlate this response with the caller's request.
 
     Returns:
         bytes: Magic-prefixed serialized result payload.
@@ -183,7 +201,7 @@ def serialize_result(value: Any, *, status: str = "ok") -> bytes:
         RuntimeError: If serialization fails.
 
     Example:
-        >>> payload = serialize_result(30, status="ok")
+        >>> payload = serialize_result(30, status="ok", task_id="task_123")
     """
     if status not in ("ok", "error"):
         raise ValueError(f"status must be 'ok' or 'error', got {status!r}.")
@@ -193,6 +211,7 @@ def serialize_result(value: Any, *, status: str = "ok") -> bytes:
             "type": "result",
             "status": status,
             "value": pickle.dumps(value),
+            "task_id": task_id,
         }
         raw: bytes = pickle.dumps(result_dict)
     except Exception as exc:
@@ -201,16 +220,22 @@ def serialize_result(value: Any, *, status: str = "ok") -> bytes:
     return RESULT_MAGIC_PREFIX + raw
 
 
-def deserialize_result(payload: bytes) -> Tuple[str, Any]:
+def deserialize_result(
+    payload: bytes,
+    with_task_id: bool = False,
+) -> Tuple:
     """
     Reconstruct an execution result from a received byte payload.
 
     Args:
-        payload: Raw bytes received from the UDP socket.
+        payload:      Raw bytes received from the UDP socket.
+        with_task_id: When True, returns a 3-tuple (status, value, task_id).
+                      When False (default), returns a 2-tuple (status, value)
+                      for complete backward compatibility.
 
     Returns:
-        Tuple of (status: str, value: Any).
-        status is 'ok' or 'error'. value is the return value or error string.
+        Tuple of (status: str, value: Any) if with_task_id is False,
+        or Tuple of (status: str, value: Any, task_id: Optional[str]) if with_task_id is True.
 
     Raises:
         ValueError:   If the payload is not a valid MeshWeaver result envelope.
@@ -218,8 +243,7 @@ def deserialize_result(payload: bytes) -> Tuple[str, Any]:
 
     Example:
         >>> status, result = deserialize_result(payload)
-        >>> if status == "ok":
-        ...     print("Result:", result)
+        >>> status, result, task_id = deserialize_result(payload, with_task_id=True)
     """
     if not isinstance(payload, (bytes, bytearray)):
         raise ValueError(f"Expected bytes payload, got {type(payload).__name__!r}.")
@@ -250,6 +274,9 @@ def deserialize_result(payload: bytes) -> Tuple[str, Any]:
     except Exception as exc:
         raise RuntimeError(f"Failed to deserialize result value: {exc}") from exc
 
+    task_id: Optional[str] = result_dict.get("task_id")
+    if with_task_id:
+        return status, value, task_id
     return status, value
 
 

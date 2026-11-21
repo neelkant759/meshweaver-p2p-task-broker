@@ -115,12 +115,16 @@ async def handle_message(
     # --- Route 3: MeshWeaver task packet (binary, starts with TASK_MAGIC_PREFIX) ---
     if is_task_payload(data):
         print(f"[Server] Received task payload from {addr} ({len(data)} bytes)")
-        try:
-            result_bytes = execute_task(data)
-            await loop.sock_sendto(sock, result_bytes, addr)
-            print(f"[Server] Sent task result to {addr} ({len(result_bytes)} bytes)")
-        except OSError as send_err:
-            print(f"[Server] Failed to send task result to {addr}: {send_err}")
+
+        async def _execute_and_send(task_data: bytes, target_addr: Tuple[str, int]) -> None:
+            try:
+                result_bytes = await asyncio.to_thread(execute_task, task_data)
+                await loop.sock_sendto(sock, result_bytes, target_addr)
+                print(f"[Server] Sent task result to {target_addr} ({len(result_bytes)} bytes)")
+            except OSError as send_err:
+                print(f"[Server] Failed to send task result to {target_addr}: {send_err}")
+
+        loop.create_task(_execute_and_send(data, addr))
         return
 
     # --- Route 2 & 3: Plain-text messages ---

@@ -265,10 +265,10 @@ class TaskRouter:
                 )
             raise
 
-        # Step 2: Remote dispatch via AsyncUDPClient
+        # Step 2: Remote dispatch via AsyncUDPClient with task_id preservation
         async with AsyncUDPClient(server_host=peer.ip, server_port=peer.port, timeout=timeout) as client:
-            await client.send_task(func, args=args, kwargs=kwargs)
-            status, val = await client.receive_task_result()
+            actual_task_id = await client.send_task(func, args=args, kwargs=kwargs, task_id=task_id)
+            status, val = await client.receive_task_result(task_id=actual_task_id, timeout=timeout)
 
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         return TaskExecutionResponse(
