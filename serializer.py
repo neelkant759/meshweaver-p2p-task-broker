@@ -307,3 +307,36 @@ def is_result_payload(data: bytes) -> bool:
         bool: True if this looks like a serialized result payload.
     """
     return isinstance(data, (bytes, bytearray)) and data.startswith(RESULT_MAGIC_PREFIX)
+
+
+def peek_task_id(payload: bytes) -> Optional[str]:
+    """
+    Quickly extract the embedded task_id from a task or result payload
+    without unpickling the callable function bytecode.
+
+    Useful for worker duplicate detection and routing before full deserialization.
+
+    Args:
+        payload: Raw bytes from the UDP socket.
+
+    Returns:
+        Optional[str]: Extracted task_id, or None if unparseable / missing.
+    """
+    if not isinstance(payload, (bytes, bytearray)):
+        return None
+
+    raw: Optional[bytes] = None
+    if payload.startswith(TASK_MAGIC_PREFIX):
+        raw = payload[len(TASK_MAGIC_PREFIX):]
+    elif payload.startswith(RESULT_MAGIC_PREFIX):
+        raw = payload[len(RESULT_MAGIC_PREFIX):]
+    else:
+        return None
+
+    try:
+        data = pickle.loads(raw)
+        if isinstance(data, dict):
+            return data.get("task_id")
+    except Exception:
+        pass
+    return None

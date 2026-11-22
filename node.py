@@ -20,6 +20,7 @@ from typing import Optional
 
 from dht import DHTNode
 from gossip import GossipEngine
+from task_registry import TaskExecutionRegistry
 from udp_server import run_server
 
 
@@ -38,9 +39,18 @@ async def run_node(host: str, port: int, bootstrap: Optional[str] = None) -> Non
     # 2. Initialize Gossip Engine with default 5.0s interval
     gossip_engine = GossipEngine(dht_node=dht_node, interval=5.0)
 
-    # 3. Start asynchronous UDP Server loop
+    # 3. Initialize Task Execution Registry for duplicate protection & caching
+    task_registry = TaskExecutionRegistry()
+
+    # 4. Start asynchronous UDP Server loop
     server_task = asyncio.create_task(
-        run_server(host=host, port=port, dht_node=dht_node, gossip_engine=gossip_engine)
+        run_server(
+            host=host,
+            port=port,
+            dht_node=dht_node,
+            gossip_engine=gossip_engine,
+            task_registry=task_registry,
+        )
     )
 
     # Allow non-blocking UDP socket to bind cleanly
@@ -76,10 +86,15 @@ async def run_node(host: str, port: int, bootstrap: Optional[str] = None) -> Non
             current_peer_count = dht_node.routing_table.total_peers()
             telemetry_count = len(gossip_engine.peer_telemetry)
 
+            # Prune expired task execution records
+            pruned_tasks = task_registry.cleanup_expired()
+            if pruned_tasks > 0:
+                print(f"[TaskRegistry] Pruned {pruned_tasks} expired task records.", flush=True)
+
             # Print status log
             peer_list = [f"{p.ip}:{p.port}" for p in dht_node.routing_table.all_peers()]
             peers_display = ", ".join(peer_list) if peer_list else "None (Standalone)"
-            print(f"[Status] DHT Peers ({current_peer_count}): [{peers_display}] | Telemetry Cached: {telemetry_count}", flush=True)
+            print(f"[Status] DHT Peers ({current_peer_count}): [{peers_display}] | Telemetry Cached: {telemetry_count} | Tasks Tracked: {task_registry.total_records()}", flush=True)
 
             if telemetry_count > 0:
                 for nid, rec in gossip_engine.peer_telemetry.items():

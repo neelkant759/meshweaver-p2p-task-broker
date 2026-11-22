@@ -23,9 +23,15 @@ import sys
 from typing import Tuple
 
 from executor import execute_task
-from serializer import is_task_payload
+from serializer import (
+    deserialize_result,
+    is_task_payload,
+    peek_task_id,
+    serialize_result,
+)
 from dht import DHTNode, is_dht_payload
 from gossip import GossipEngine, is_gossip_payload
+from task_registry import TaskExecutionRegistry, TaskState
 
 # Default Server Configuration
 DEFAULT_HOST: str = "127.0.0.1"
@@ -73,6 +79,7 @@ async def handle_message(
     addr: Tuple[str, int],
     dht_node: DHTNode | None = None,
     gossip_engine: GossipEngine | None = None,
+    task_registry: TaskExecutionRegistry | None = None,
 ) -> None:
     """
     Processes a received datagram and dispatches the appropriate response.
@@ -83,7 +90,7 @@ async def handle_message(
       2. MeshWeaver Gossip message (starts with MWGOSSIP:):
          Processes periodic telemetry (CPU/RAM) and gossip neighbor discovery.
       3. MeshWeaver task payload (binary, identified by TASK_MAGIC_PREFIX):
-         Deserializes and executes the function; sends back a result payload.
+         Deserializes and executes the function with duplicate protection; sends back a result payload.
       4. Plain-text "PING" -> responds "PONG" (health-check).
       5. Any other text -> responds with an error message.
 
@@ -94,6 +101,7 @@ async def handle_message(
         addr: Tuple of (client_ip, client_port).
         dht_node: Optional active DHTNode controller instance for peer discovery.
         gossip_engine: Optional active GossipEngine instance for telemetry synchronization.
+        task_registry: Optional active TaskExecutionRegistry for deduplication and result caching.
     """
     # --- Route 1: Kademlia DHT Discovery Message ---
     if is_dht_payload(data):
@@ -117,12 +125,64 @@ async def handle_message(
         print(f"[Server] Received task payload from {addr} ({len(data)} bytes)")
 
         async def _execute_and_send(task_data: bytes, target_addr: Tuple[str, int]) -> None:
+            nonlocal task_registry
+            task_id = peek_task_id(task_data)
+
+            # Fallback for untracked / legacy tasks without task_id or without registry
+            if not task_id or task_registry is None:
+                try:
+                    result_bytes = await asyncio.to_thread(execute_task, task_data)
+                    await loop.sock_sendto(sock, result_bytes, target_addr)
+                    print(f"[Server] Sent legacy task result to {target_addr} ({len(result_bytes)} bytes)")
+                except OSError as send_err:
+                    print(f"[Server] Failed to send legacy task result to {target_addr}: {send_err}")
+                return
+
+            # Consult registry for duplicate detection
+            state, cached_bytes, waiter_fut = task_registry.register_or_wait(task_id, loop=loop)
+
+            # Case 1: Result is already computed and cached (COMPLETED or FAILED)
+            if state in (TaskState.COMPLETED, TaskState.FAILED) and cached_bytes is not None:
+                print(f"[Server] Duplicate Task [{task_id}] detected in state {state.value}. Returning cached result.")
+                try:
+                    await loop.sock_sendto(sock, cached_bytes, target_addr)
+                except OSError as send_err:
+                    print(f"[Server] Failed to send cached result for [{task_id}] to {target_addr}: {send_err}")
+                return
+
+            # Case 2: Task is currently RUNNING; await the active execution without re-invoking
+            if waiter_fut is not None:
+                print(f"[Server] Concurrent duplicate Task [{task_id}] is currently RUNNING. Waiting for in-flight execution...")
+                try:
+                    result_bytes = await waiter_fut
+                    await loop.sock_sendto(sock, result_bytes, target_addr)
+                    print(f"[Server] Sent in-flight result for [{task_id}] to {target_addr} ({len(result_bytes)} bytes)")
+                except Exception as wait_err:
+                    print(f"[Server] Error waiting for in-flight task [{task_id}]: {wait_err}")
+                return
+
+            # Case 3: Newly registered task; this coroutine owns the execution
             try:
                 result_bytes = await asyncio.to_thread(execute_task, task_data)
+                try:
+                    status, _ = deserialize_result(result_bytes)
+                except Exception:
+                    status = "ok"
+
+                if status == "ok":
+                    task_registry.complete_task(task_id, result_bytes)
+                else:
+                    task_registry.fail_task(task_id, result_bytes)
+
                 await loop.sock_sendto(sock, result_bytes, target_addr)
-                print(f"[Server] Sent task result to {target_addr} ({len(result_bytes)} bytes)")
-            except OSError as send_err:
-                print(f"[Server] Failed to send task result to {target_addr}: {send_err}")
+                print(f"[Server] Sent task [{task_id}] result to {target_addr} ({len(result_bytes)} bytes)")
+            except Exception as exec_err:
+                error_bytes = serialize_result(str(exec_err), status="error", task_id=task_id)
+                task_registry.fail_task(task_id, error_bytes)
+                try:
+                    await loop.sock_sendto(sock, error_bytes, target_addr)
+                except OSError as send_err:
+                    print(f"[Server] Failed to send error result for [{task_id}] to {target_addr}: {send_err}")
 
         loop.create_task(_execute_and_send(data, addr))
         return
@@ -165,6 +225,7 @@ async def run_server(
     port: int = DEFAULT_PORT,
     dht_node: DHTNode | None = None,
     gossip_engine: GossipEngine | None = None,
+    task_registry: TaskExecutionRegistry | None = None,
 ) -> None:
     """
     Runs the asynchronous UDP server event loop.
@@ -177,7 +238,11 @@ async def run_server(
         port: Port number to bind.
         dht_node: Optional active DHTNode controller instance.
         gossip_engine: Optional active GossipEngine instance.
+        task_registry: Optional active TaskExecutionRegistry for task deduplication.
     """
+    if task_registry is None:
+        task_registry = TaskExecutionRegistry()
+
     sock: socket.socket | None = None
     try:
         sock = create_udp_socket(host, port)
@@ -204,7 +269,13 @@ async def run_server(
                 if not data or not addr:
                     continue
                 await handle_message(
-                    loop, sock, data, addr, dht_node=dht_node, gossip_engine=gossip_engine
+                    loop,
+                    sock,
+                    data,
+                    addr,
+                    dht_node=dht_node,
+                    gossip_engine=gossip_engine,
+                    task_registry=task_registry,
                 )
             except asyncio.CancelledError:
                 # Raised when the server task is cancelled during shutdown

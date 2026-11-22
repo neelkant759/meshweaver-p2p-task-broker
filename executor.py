@@ -30,6 +30,7 @@ from serializer import (
     is_task_payload,
     serialize_result,
 )
+from task_registry import TaskExecutionRegistry, TaskRecord, TaskState
 
 
 def execute_task(payload: bytes) -> bytes:
