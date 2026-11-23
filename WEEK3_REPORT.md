@@ -2,9 +2,9 @@
 
 ## Project Details
 - **Project**: MeshWeaver – Zero-Dependency P2P Async Task Broker
-- **Phase**: Week 3 – Decentralized Task Scheduling, Remote Task Dispatch, Response Demultiplexing & Duplicate Protection
-- **Current Status**: Intelligent Peer Selection, Remote Task Dispatch, Reliable Task ID Demultiplexing, and Worker-Side Duplicate Task Execution Protection Implemented and Fully Verified
-- **Date**: 22 November 2026
+- **Phase**: Week 3 – Decentralized Task Scheduling, Remote Task Dispatch, Response Demultiplexing, Duplicate Protection & Fault-Tolerant Reassignment
+- **Current Status**: Intelligent Peer Selection, Remote Task Dispatch, Reliable Task ID Demultiplexing, Worker Duplicate Execution Protection, and Automatic Fault-Tolerant Task Reassignment Implemented and Fully Verified
+- **Date**: 23 November 2026
 
 ---
 
@@ -17,7 +17,7 @@
 | **Stale Telemetry Pruning** | **COMPLETED** | Prunes peer records older than `stale_threshold` (default: 30.0s) |
 | **Peer Exclusion Filtering** | **COMPLETED** | Case-insensitive exclusion of specific peer IDs (e.g. self or failed nodes) |
 | **Remote Task Dispatching** | **COMPLETED** | `TaskRouter.dispatch_task()` serializes callable, selects peer, and executes over UDP |
-| **Structured `TaskExecutionResponse`** | **COMPLETED** | Standardized response schema: `task_id`, `status`, `result`, `executed_by`, `target_node_id`, `round_trip_ms` |
+| **Structured `TaskExecutionResponse`** | **COMPLETED** | Standardized response schema: `task_id`, `status`, `result`, `executed_by`, `target_node_id`, `round_trip_ms`, `attempts`, `retries` |
 | **Unique Task ID Generation** | **COMPLETED** | Universally unique `task_id` assigned per task (`f"task_{uuid.uuid4().hex[:12]}"`) |
 | **Task ID Wire Preservation** | **COMPLETED** | `task_id` embedded in request payload (`MWTK:`) and returned in result envelope (`MWRS:`) |
 | **Single Background Demux Listener** | **COMPLETED** | Exactly one background asyncio listener per `AsyncUDPClient` instance routes results to matching futures |
@@ -31,7 +31,11 @@
 | **In-Flight Duplicate Multiplexing** | **COMPLETED** | Concurrent duplicate requests attach as `waiters` to the active execution and receive results simultaneously |
 | **Configurable TTL Cleanup** | **COMPLETED** | Prunes completed/failed records older than `ttl_seconds` (default: 300.0s) |
 | **Fast Payload Inspection** | **COMPLETED** | Implemented `serializer.peek_task_id()` to extract `task_id` without unpickling callable bytecode |
-| **Automated Regression Suite** | **COMPLETED** | **124 tests passing total** across 7 test modules (0 failures, 0 errors, 100% pass rate) |
+| **Automatic Task Retry & Reassignment** | **COMPLETED** | Automatically reassigns task to next healthy peer upon worker timeout, disconnect, or communication failure |
+| **Task ID Preservation Across Retries** | **COMPLETED** | Original `task_id` preserved across all retry attempts and workers for end-to-end correlation |
+| **Configurable Retry Limits & Delay** | **COMPLETED** | Configurable `max_retries` (default: 0 for backward compatibility), `retry_delay`, and `retry_on_remote_error` |
+| **Peer Exhaustion & Local Fallback** | **COMPLETED** | Raises descriptive `NoPeerAvailableError` when all peers are exhausted; falls back to local execution if enabled |
+| **Automated Regression Suite** | **COMPLETED** | **134 tests passing total** across 8 test modules (0 failures, 0 errors, 100% pass rate) |
 
 ---
 
@@ -78,6 +82,33 @@ Worker nodes maintain an active `TaskExecutionRegistry`:
   - **Failed Duplicates**: Replays the cached error payload and ensures subsequent legitimate tasks remain unblocked.
 - **TTL Pruning**: `cleanup_expired(ttl_seconds)` safely removes stale completed/failed records. In `node.py`, the live status loop prunes records older than 300 seconds automatically.
 
+### 4. Fault-Tolerant Automatic Task Retry & Peer Reassignment (`router.py`)
+`TaskRouter.dispatch_task()` implements an intelligent, self-healing dispatch loop:
+```
+Dispatch Task (task_id)
+       │
+       ▼
+Select Best Peer (Lowest CPU / Free RAM)
+       │
+       ▼
+Send over UDP ────(TimeoutError / ConnectionResetError / Failure)───┐
+       │                                                            │
+       │ (Success)                                                  ▼
+       │                                               Exclude Failed Peer
+       │                                               from Candidate Pool
+       ▼                                                            │
+Return TaskExecutionResponse                                        ▼
+(attempts, retries, round_trip_ms)                     Attempts <= max_retries?
+                                                            ├── Yes ──> Sleep(retry_delay) ──> Re-select Peer
+                                                            └── No  ──> Fallback to local or raise Error
+```
+
+- **Dynamic Peer Exclusion**: When a peer fails to reply within `timeout` or closes connection, it is added to the dynamic `excluded` set for this task.
+- **Telemetry Re-evaluation**: The router selects the next best available peer from `GossipEngine.peer_telemetry` that is not excluded and not stale.
+- **Strict Task ID Preservation**: The original `task_id` is retained across all attempts, ensuring correlation and enabling workers that previously finished the task to return cached results.
+- **Peer Exhaustion Handling**: When all eligible peers have been tried and exhausted, `dispatch_task` either executes locally (if `fallback_to_local=True`) or raises a descriptive `NoPeerAvailableError` chained to the underlying failure.
+- **Configurable Control**: Supports `max_retries` (default: 0 to guarantee backward compatibility with single-attempt tests), `retry_delay`, and `retry_on_remote_error`.
+
 ---
 
 ## Automated Test Results
@@ -85,37 +116,34 @@ Worker nodes maintain an active `TaskExecutionRegistry`:
 ```
 Command: python -m unittest discover -s tests -v
 
-Ran 124 tests in 6.680s
+Ran 134 tests in 7.018s
 
-OK (124/124 passed, 0 failures, 0 errors, 0 skipped)
+OK (134/134 passed, 0 failures, 0 errors, 0 skipped)
 ```
 
 ### Complete Test Suite Breakdown:
-1. **`tests/test_task_registry.py` (14 tests - NEW)**:
-   - `test_peek_task_id_from_task_payload`: Fast metadata extraction from task request.
-   - `test_peek_task_id_none_when_omitted`: Graceful handling of legacy payloads.
-   - `test_peek_task_id_from_result_payload`: Extraction from result envelopes.
-   - `test_peek_task_id_invalid_payload`: Rejection of corrupted / empty payloads.
-   - `test_initial_registration_returns_running`: State transition to RUNNING on first arrival.
-   - `test_duplicate_while_running_attaches_waiter`: In-flight duplicate attaches future waiter.
-   - `test_cached_result_retrieval_after_completion`: Cached result retrieval without re-execution.
-   - `test_failed_task_caching_and_subsequent_tasks`: Failed task error caching without blocking future tasks.
-   - `test_ttl_cleanup_expired_records`: Proper pruning of records older than TTL.
-   - `test_duplicate_submission_after_completion_returns_cached_result`: End-to-end socket duplicate verification.
-   - `test_same_task_submitted_concurrently_executes_once`: In-flight concurrency suppression over UDP.
-   - `test_failed_task_cached_and_replayed`: End-to-end socket error replay.
-   - `test_distinct_task_ids_execute_independently`: Parallel distinct task execution without interference.
-   - `test_legacy_tasks_without_task_id_supported`: Backward compatibility for tasks without task IDs.
-2. **`tests/test_task_id_matching.py` (13 tests)**: Client demultiplexing, out-of-order responses, 5+ concurrency, cancellation, legacy fallbacks.
-3. **`tests/test_router_dispatch.py` (9 tests)**: Remote dispatch, addition, multi-arguments, complex callable, process isolation, structured fields, timeout, and local fallback.
-4. **`tests/test_router.py` (14 tests)**: Peer selection, CPU/RAM/NodeID ranking, staleness, exclusions, fallback.
-5. **`tests/test_gossip.py` (13 tests)**: Gossip protocol, CPU/RAM telemetry, periodic broadcasting.
-6. **`tests/test_dht.py` (20 tests)**: Kademlia DHT, XOR metric, routing tables, dynamic discovery.
-7. **`tests/test_serializer.py` (33 tests)**: Cloudpickle serialization, lambdas, closures, result encoding.
-8. **`tests/test_udp.py` (8 tests)**: Core asynchronous UDP server, client, PING/PONG.
+1. **`tests/test_router_retry.py` (10 tests - NEW)**:
+   - `test_worker_timeout_triggers_automatic_reassignment`: Primary dead peer times out and reassigns to healthy peer.
+   - `test_task_id_strictly_preserved_across_retries`: Original task ID maintained through multi-worker retries.
+   - `test_retry_limits_enforced_and_raises_timeout`: Halts after `max_retries` attempts and raises exception.
+   - `test_no_alternative_peer_available_raises_no_peer_available_error`: Peer exhaustion handling when no alternatives exist.
+   - `test_local_fallback_on_peer_exhaustion`: Automatic local execution fallback when all remote peers fail.
+   - `test_duplicate_execution_avoided_on_retried_peer`: Cached result replay when retrying a peer that already finished.
+   - `test_configurable_retry_delay`: Verification of `retry_delay` timing between reassignment attempts.
+   - `test_remote_execution_error_with_retry_enabled`: Reassignment when worker returns application error if configured.
+   - `test_multi_worker_reassignment_chain`: Chain of 3 failing workers preceding successful execution on 4th node.
+   - `test_clean_client_state_after_reassignment`: Verifies zero socket/future resource leaks after retries.
+2. **`tests/test_task_registry.py` (14 tests)**: In-flight deduplication, cached result replay, failed task handling, TTL cleanup, legacy fallback.
+3. **`tests/test_task_id_matching.py` (13 tests)**: Client demultiplexing, out-of-order responses, 5+ concurrency, cancellation, legacy fallbacks.
+4. **`tests/test_router_dispatch.py` (9 tests)**: Remote dispatch, addition, multi-arguments, complex callable, process isolation, structured fields, timeout, and local fallback.
+5. **`tests/test_router.py` (14 tests)**: Peer selection, CPU/RAM/NodeID ranking, staleness, exclusions, fallback.
+6. **`tests/test_gossip.py` (13 tests)**: Gossip protocol, CPU/RAM telemetry, periodic broadcasting.
+7. **`tests/test_dht.py` (20 tests)**: Kademlia DHT, XOR metric, routing tables, dynamic discovery.
+8. **`tests/test_serializer.py` (33 tests)**: Cloudpickle serialization, lambdas, closures, result encoding.
+9. **`tests/test_udp.py` (8 tests)**: Core asynchronous UDP server, client, PING/PONG.
 
 ---
 
 ## Remaining Scope / Next Milestones
-- **Automatic Task Reassignment & Retry Loop**: When a target peer fails to respond or times out, automatically exclude the failed peer and re-route the task to the next eligible node via Gossip telemetry up to `max_retries`.
-- **Peer Capability Negotiation**: Extend Gossip heartbeats to advertise specialized capabilities (e.g., GPU support, worker tags, max concurrent tasks).
+- **Worker Peer Capability Negotiation**: Extend Gossip heartbeats to advertise specialized capabilities (e.g., worker concurrency limits, compute tags, GPU support).
+- **Batch / Parallel Task Dispatching (`dispatch_batch`)**: Distribute lists of tasks across multiple peers concurrently using optimal load distribution.

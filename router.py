@@ -42,6 +42,8 @@ class TaskExecutionResponse:
         executed_by: Endpoint of the node that executed the task ("ip:port" or "local").
         target_node_id: 160-bit hex identifier of the executing peer (or None if local).
         round_trip_ms: Total latency from task dispatch to result receipt in milliseconds.
+        attempts: Total number of execution attempts made (default: 1).
+        retries: Number of retries performed after the initial attempt (default: 0).
     """
     task_id: str
     status: str
@@ -49,6 +51,8 @@ class TaskExecutionResponse:
     executed_by: str
     target_node_id: Optional[str] = None
     round_trip_ms: float = 0.0
+    attempts: int = 1
+    retries: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the response to a standard Python dictionary."""
@@ -70,6 +74,9 @@ class TaskRouter:
         gossip_engine: GossipEngine,
         stale_threshold: float = DEFAULT_STALE_THRESHOLD,
         fallback_to_local: bool = False,
+        max_retries: int = 0,
+        retry_delay: float = 0.0,
+        retry_on_remote_error: bool = False,
     ) -> None:
         """
         Initialize the TaskRouter.
@@ -78,10 +85,16 @@ class TaskRouter:
             gossip_engine: Active GossipEngine holding peer telemetry.
             stale_threshold: Max age in seconds before peer telemetry is considered stale.
             fallback_to_local: Whether to fallback to local execution when no remote peer is available.
+            max_retries: Maximum number of reassignment retries on worker failure (default: 0).
+            retry_delay: Delay in seconds before re-attempting task dispatch (default: 0.0).
+            retry_on_remote_error: Whether to reassign task if worker returns an execution error (default: False).
         """
         self.gossip_engine: GossipEngine = gossip_engine
         self.stale_threshold: float = stale_threshold
         self.fallback_to_local: bool = fallback_to_local
+        self.max_retries: int = max_retries
+        self.retry_delay: float = retry_delay
+        self.retry_on_remote_error: bool = retry_on_remote_error
 
     def select_target_peer(
         self,
@@ -210,34 +223,44 @@ class TaskRouter:
         timeout: float = 5.0,
         exclude_nodes: Optional[Set[str] | List[str]] = None,
         now: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+        retry_on_remote_error: Optional[bool] = None,
     ) -> TaskExecutionResponse:
         """
-        Select an optimal peer via Gossip telemetry and dispatch the task remotely over UDP.
+        Select an optimal peer via Gossip telemetry and dispatch the task remotely over UDP,
+        with automatic reassignment and retry when a worker peer fails or times out.
 
         Workflow:
-        1. Generates a unique task_id if one is not provided.
+        1. Generates a unique task_id if one is not provided, preserving it across retries.
         2. Measures round_trip_ms using high-precision monotonic timing.
         3. Selects the target peer using multi-criteria ranking (lowest CPU, highest RAM).
            If no peer is available and fallback_to_local is True, executes locally.
         4. Serializes and transmits the task payload over UDP via AsyncUDPClient.
         5. Receives, deserializes, and formats the execution outcome into a TaskExecutionResponse.
+        6. On worker failure or timeout, automatically excludes the failed peer and reassigns
+           the task to the next eligible healthy peer up to max_retries.
 
         Args:
             func: The Python callable to execute remotely.
             args: Positional arguments for the callable.
             kwargs: Keyword arguments for the callable.
-            task_id: Optional unique identifier; auto-generated if omitted.
+            task_id: Optional unique identifier; auto-generated if omitted (preserved across retries).
             timeout: Maximum wait time in seconds for the remote node to return a result.
             exclude_nodes: Node IDs to exclude from peer selection.
             now: Optional reference timestamp for staleness filtering.
+            max_retries: Maximum number of retries upon worker failure (defaults to self.max_retries).
+            retry_delay: Optional delay in seconds before retrying (defaults to self.retry_delay).
+            retry_on_remote_error: Whether to retry when worker returns an execution error (defaults to self.retry_on_remote_error).
 
         Returns:
             TaskExecutionResponse: Complete execution record including task_id, status,
-                                   result, executed_by, target_node_id, and round_trip_ms.
+                                   result, executed_by, target_node_id, round_trip_ms,
+                                   attempts, and retries.
 
         Raises:
             NoPeerAvailableError: If no eligible remote peers exist and fallback_to_local is False.
-            TimeoutError: If the remote peer fails to return a result within the timeout.
+            TimeoutError: If all selected remote peers fail to return a result within the timeout.
             RuntimeError / OSError: On network or communication failures.
         """
         if task_id is None:
@@ -247,38 +270,96 @@ class TaskRouter:
             kwargs = {}
 
         start_time = time.perf_counter()
+        effective_max_retries = max_retries if max_retries is not None else self.max_retries
+        effective_retry_delay = retry_delay if retry_delay is not None else self.retry_delay
+        effective_retry_on_error = (
+            retry_on_remote_error if retry_on_remote_error is not None else self.retry_on_remote_error
+        )
 
-        # Step 1: Select peer with local fallback support
-        try:
-            peer, metrics = self.select_target_peer(exclude_nodes=exclude_nodes, now=now)
-        except NoPeerAvailableError:
-            if self.fallback_to_local:
-                status, val = run_task_locally(func, args=args, kwargs=kwargs)
+        excluded: Set[str] = {
+            str(n).strip().lower() for n in (exclude_nodes or set())
+        }
+
+        attempts = 0
+        last_exception: Optional[Exception] = None
+
+        while True:
+            # Step 1: Select peer excluding previously failed or user-excluded nodes
+            try:
+                peer, metrics = self.select_target_peer(exclude_nodes=excluded, now=now)
+            except NoPeerAvailableError as no_peer_err:
+                if self.fallback_to_local:
+                    status, val = run_task_locally(func, args=args, kwargs=kwargs)
+                    duration_ms = (time.perf_counter() - start_time) * 1000.0
+                    return TaskExecutionResponse(
+                        task_id=task_id,
+                        status=status,
+                        result=val,
+                        executed_by="local",
+                        target_node_id=None,
+                        round_trip_ms=round(duration_ms, 2),
+                        attempts=attempts + 1,
+                        retries=attempts,
+                    )
+                if last_exception is not None:
+                    raise NoPeerAvailableError(
+                        f"Task [{task_id}] failed after {attempts} attempt(s); no alternative peer available. "
+                        f"Last error: {last_exception}"
+                    ) from last_exception
+                raise no_peer_err
+
+            # Step 2: Remote dispatch via AsyncUDPClient with task_id preservation
+            try:
+                async with AsyncUDPClient(
+                    server_host=peer.ip, server_port=peer.port, timeout=timeout
+                ) as client:
+                    actual_task_id = await client.send_task(
+                        func, args=args, kwargs=kwargs, task_id=task_id
+                    )
+                    status, val = await client.receive_task_result(
+                        task_id=actual_task_id, timeout=timeout
+                    )
+
+                if status == "error" and effective_retry_on_error:
+                    raise RuntimeError(f"Remote execution returned error status: {val}")
+
                 duration_ms = (time.perf_counter() - start_time) * 1000.0
                 return TaskExecutionResponse(
                     task_id=task_id,
                     status=status,
                     result=val,
-                    executed_by="local",
-                    target_node_id=None,
+                    executed_by=f"{peer.ip}:{peer.port}",
+                    target_node_id=peer.node_id,
                     round_trip_ms=round(duration_ms, 2),
+                    attempts=attempts + 1,
+                    retries=attempts,
                 )
-            raise
 
-        # Step 2: Remote dispatch via AsyncUDPClient with task_id preservation
-        async with AsyncUDPClient(server_host=peer.ip, server_port=peer.port, timeout=timeout) as client:
-            actual_task_id = await client.send_task(func, args=args, kwargs=kwargs, task_id=task_id)
-            status, val = await client.receive_task_result(task_id=actual_task_id, timeout=timeout)
+            except (TimeoutError, ConnectionResetError, OSError, RuntimeError) as exc:
+                last_exception = exc
+                attempts += 1
+                # Mark failed peer as excluded to reassign to a DIFFERENT healthy peer
+                excluded.add(peer.node_id.strip().lower())
 
-        duration_ms = (time.perf_counter() - start_time) * 1000.0
-        return TaskExecutionResponse(
-            task_id=task_id,
-            status=status,
-            result=val,
-            executed_by=f"{peer.ip}:{peer.port}",
-            target_node_id=peer.node_id,
-            round_trip_ms=round(duration_ms, 2),
-        )
+                # Check if retry limit reached
+                if attempts > effective_max_retries:
+                    if self.fallback_to_local:
+                        status, val = run_task_locally(func, args=args, kwargs=kwargs)
+                        duration_ms = (time.perf_counter() - start_time) * 1000.0
+                        return TaskExecutionResponse(
+                            task_id=task_id,
+                            status=status,
+                            result=val,
+                            executed_by="local",
+                            target_node_id=None,
+                            round_trip_ms=round(duration_ms, 2),
+                            attempts=attempts,
+                            retries=attempts - 1,
+                        )
+                    raise exc
+
+                if effective_retry_delay > 0:
+                    await asyncio.sleep(effective_retry_delay)
 
     def dispatch_task_sync(
         self,
@@ -289,6 +370,9 @@ class TaskRouter:
         timeout: float = 5.0,
         exclude_nodes: Optional[Set[str] | List[str]] = None,
         now: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+        retry_on_remote_error: Optional[bool] = None,
     ) -> TaskExecutionResponse:
         """Synchronous wrapper for dispatch_task."""
         return asyncio.run(
@@ -300,5 +384,8 @@ class TaskRouter:
                 timeout=timeout,
                 exclude_nodes=exclude_nodes,
                 now=now,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                retry_on_remote_error=retry_on_remote_error,
             )
         )
