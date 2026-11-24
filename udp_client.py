@@ -27,6 +27,12 @@ from serializer import (
     is_result_payload,
     serialize_task,
 )
+from security import (
+    InvalidSignatureError,
+    is_signed_payload,
+    sign_payload,
+    verify_and_unpack_payload,
+)
 
 # Default Client Configuration
 DEFAULT_SERVER_HOST: str = "127.0.0.1"
@@ -51,10 +57,16 @@ class AsyncUDPClient:
         server_host: str = DEFAULT_SERVER_HOST,
         server_port: int = DEFAULT_SERVER_PORT,
         timeout: float = DEFAULT_TIMEOUT,
+        secret_key: Optional[bytes | str] = None,
+        enforce_signatures: bool = False,
     ) -> None:
         self.server_host: str = server_host
         self.server_port: int = server_port
         self.timeout: float = timeout
+        self.secret_key: Optional[bytes] = (
+            secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
+        )
+        self.enforce_signatures: bool = enforce_signatures
         self.sock: Optional[socket.socket] = None
         self._is_open: bool = False
 
@@ -153,10 +165,26 @@ class AsyncUDPClient:
                 if not raw:
                     continue
 
+                # Cryptographic signature unpacking and verification
+                payload_to_process = raw
+                if is_signed_payload(raw):
+                    if self.secret_key:
+                        try:
+                            payload_to_process = verify_and_unpack_payload(raw, self.secret_key)
+                        except InvalidSignatureError as sig_err:
+                            print(f"[Client Warning] Dropping response with invalid signature from {addr}: {sig_err}")
+                            continue
+                    else:
+                        print(f"[Client Warning] Received signed payload from {addr} but no secret_key configured. Dropping.")
+                        continue
+                elif self.enforce_signatures and is_result_payload(raw):
+                    print(f"[Client Warning] Dropping unsigned result payload from {addr} because signatures are enforced.")
+                    continue
+
                 # Route 1: MeshWeaver Task Result Payload
-                if is_result_payload(raw):
+                if is_result_payload(payload_to_process):
                     try:
-                        status, value, task_id = deserialize_result(raw, with_task_id=True)
+                        status, value, task_id = deserialize_result(payload_to_process, with_task_id=True)
                     except Exception as parse_err:
                         # Safeguard 6: Malformed response must not crash listener
                         print(f"[Client Warning] Received malformed result payload from {addr}: {parse_err}")
@@ -325,6 +353,9 @@ class AsyncUDPClient:
             print(f"[Client Error] Task serialization failed: {exc}")
             raise
 
+        if self.secret_key:
+            payload = sign_payload(payload, self.secret_key, is_result=False)
+
         print(f"[Client] Sending task [{task_id}] to {self.server_host}:{self.server_port} ({len(payload)} bytes)")
         try:
             await loop.sock_sendto(self.sock, payload, (self.server_host, self.server_port))
@@ -427,6 +458,8 @@ async def run_client(
     port: int = DEFAULT_SERVER_PORT,
     timeout: float = DEFAULT_TIMEOUT,
     message: str = "PING",
+    secret_key: Optional[bytes | str] = None,
+    enforce_signatures: bool = False,
 ) -> None:
     """
     Executes a client communication lifecycle and performs graceful shutdown.
@@ -436,8 +469,16 @@ async def run_client(
         port: Target server Port.
         timeout: Wait timeout in seconds.
         message: Payload message to transmit.
+        secret_key: Optional HMAC-SHA256 secret key for signing tasks.
+        enforce_signatures: Whether to enforce cryptographic signatures on responses.
     """
-    client = AsyncUDPClient(server_host=host, server_port=port, timeout=timeout)
+    client = AsyncUDPClient(
+        server_host=host,
+        server_port=port,
+        timeout=timeout,
+        secret_key=secret_key,
+        enforce_signatures=enforce_signatures,
+    )
     client.start()
 
     print("\nMeshWeaver UDP Client Initialized")

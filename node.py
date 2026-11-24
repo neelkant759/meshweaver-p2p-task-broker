@@ -24,7 +24,13 @@ from task_registry import TaskExecutionRegistry
 from udp_server import run_server
 
 
-async def run_node(host: str, port: int, bootstrap: Optional[str] = None) -> None:
+async def run_node(
+    host: str,
+    port: int,
+    bootstrap: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    enforce_signatures: bool = False,
+) -> None:
     """
     Initializes and orchestrates the MeshWeaver P2P Node runtime:
     1. Instantiates the Kademlia DHTNode.
@@ -50,6 +56,8 @@ async def run_node(host: str, port: int, bootstrap: Optional[str] = None) -> Non
             dht_node=dht_node,
             gossip_engine=gossip_engine,
             task_registry=task_registry,
+            secret_key=secret_key,
+            enforce_signatures=enforce_signatures,
         )
     )
 
@@ -133,10 +141,24 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Listening IP address")
     parser.add_argument("--port", type=int, default=8000, help="Listening UDP port number")
     parser.add_argument("--bootstrap", help="Bootstrap node address in IP:PORT format")
+    parser.add_argument("--secret-key", help="Shared secret key for HMAC-SHA256 task signatures")
+    parser.add_argument(
+        "--enforce-signatures",
+        action="store_true",
+        help="Enforce cryptographic signatures, rejecting unsigned task requests",
+    )
     args = parser.parse_args()
 
     try:
-        asyncio.run(run_node(host=args.host, port=args.port, bootstrap=args.bootstrap))
+        asyncio.run(
+            run_node(
+                host=args.host,
+                port=args.port,
+                bootstrap=args.bootstrap,
+                secret_key=args.secret_key,
+                enforce_signatures=args.enforce_signatures,
+            )
+        )
     except KeyboardInterrupt:
         print("\n[+] MeshWeaver Node stopped cleanly by user.")
         sys.exit(0)

@@ -77,6 +77,8 @@ class TaskRouter:
         max_retries: int = 0,
         retry_delay: float = 0.0,
         retry_on_remote_error: bool = False,
+        secret_key: Optional[bytes | str] = None,
+        enforce_signatures: bool = False,
     ) -> None:
         """
         Initialize the TaskRouter.
@@ -88,6 +90,8 @@ class TaskRouter:
             max_retries: Maximum number of reassignment retries on worker failure (default: 0).
             retry_delay: Delay in seconds before re-attempting task dispatch (default: 0.0).
             retry_on_remote_error: Whether to reassign task if worker returns an execution error (default: False).
+            secret_key: Optional HMAC-SHA256 secret key for signing dispatched tasks.
+            enforce_signatures: Whether to enforce cryptographic signatures on responses.
         """
         self.gossip_engine: GossipEngine = gossip_engine
         self.stale_threshold: float = stale_threshold
@@ -95,6 +99,8 @@ class TaskRouter:
         self.max_retries: int = max_retries
         self.retry_delay: float = retry_delay
         self.retry_on_remote_error: bool = retry_on_remote_error
+        self.secret_key: Optional[bytes | str] = secret_key
+        self.enforce_signatures: bool = enforce_signatures
 
     def select_target_peer(
         self,
@@ -226,6 +232,8 @@ class TaskRouter:
         max_retries: Optional[int] = None,
         retry_delay: Optional[float] = None,
         retry_on_remote_error: Optional[bool] = None,
+        secret_key: Optional[bytes | str] = None,
+        enforce_signatures: Optional[bool] = None,
     ) -> TaskExecutionResponse:
         """
         Select an optimal peer via Gossip telemetry and dispatch the task remotely over UDP,
@@ -275,6 +283,10 @@ class TaskRouter:
         effective_retry_on_error = (
             retry_on_remote_error if retry_on_remote_error is not None else self.retry_on_remote_error
         )
+        effective_secret_key = secret_key if secret_key is not None else self.secret_key
+        effective_enforce_sig = (
+            enforce_signatures if enforce_signatures is not None else self.enforce_signatures
+        )
 
         excluded: Set[str] = {
             str(n).strip().lower() for n in (exclude_nodes or set())
@@ -311,7 +323,11 @@ class TaskRouter:
             # Step 2: Remote dispatch via AsyncUDPClient with task_id preservation
             try:
                 async with AsyncUDPClient(
-                    server_host=peer.ip, server_port=peer.port, timeout=timeout
+                    server_host=peer.ip,
+                    server_port=peer.port,
+                    timeout=timeout,
+                    secret_key=effective_secret_key,
+                    enforce_signatures=effective_enforce_sig,
                 ) as client:
                     actual_task_id = await client.send_task(
                         func, args=args, kwargs=kwargs, task_id=task_id
@@ -373,6 +389,8 @@ class TaskRouter:
         max_retries: Optional[int] = None,
         retry_delay: Optional[float] = None,
         retry_on_remote_error: Optional[bool] = None,
+        secret_key: Optional[bytes | str] = None,
+        enforce_signatures: Optional[bool] = None,
     ) -> TaskExecutionResponse:
         """Synchronous wrapper for dispatch_task."""
         return asyncio.run(

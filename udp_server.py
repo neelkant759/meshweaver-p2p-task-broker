@@ -32,6 +32,12 @@ from serializer import (
 from dht import DHTNode, is_dht_payload
 from gossip import GossipEngine, is_gossip_payload
 from task_registry import TaskExecutionRegistry, TaskState
+from security import (
+    InvalidSignatureError,
+    is_signed_payload,
+    sign_payload,
+    verify_and_unpack_payload,
+)
 
 # Default Server Configuration
 DEFAULT_HOST: str = "127.0.0.1"
@@ -80,6 +86,8 @@ async def handle_message(
     dht_node: DHTNode | None = None,
     gossip_engine: GossipEngine | None = None,
     task_registry: TaskExecutionRegistry | None = None,
+    secret_key: Optional[bytes | str] = None,
+    enforce_signatures: bool = False,
 ) -> None:
     """
     Processes a received datagram and dispatches the appropriate response.
@@ -89,8 +97,8 @@ async def handle_message(
          Processes Kademlia peer discovery and returns DHT responses.
       2. MeshWeaver Gossip message (starts with MWGOSSIP:):
          Processes periodic telemetry (CPU/RAM) and gossip neighbor discovery.
-      3. MeshWeaver task payload (binary, identified by TASK_MAGIC_PREFIX):
-         Deserializes and executes the function with duplicate protection; sends back a result payload.
+      3. MeshWeaver task payload (binary, identified by TASK_MAGIC_PREFIX or MWSTK:):
+         Verifies cryptographic signature if present or enforced; executes with duplicate protection.
       4. Plain-text "PING" -> responds "PONG" (health-check).
       5. Any other text -> responds with an error message.
 
@@ -102,7 +110,45 @@ async def handle_message(
         dht_node: Optional active DHTNode controller instance for peer discovery.
         gossip_engine: Optional active GossipEngine instance for telemetry synchronization.
         task_registry: Optional active TaskExecutionRegistry for deduplication and result caching.
+        secret_key: Optional HMAC-SHA256 secret key for task authentication and verification.
+        enforce_signatures: Whether to reject unsigned task payloads strictly.
     """
+    is_request_signed = False
+
+    # --- Route 0: Cryptographic Signature Verification ---
+    if is_signed_payload(data):
+        if secret_key:
+            try:
+                data = verify_and_unpack_payload(data, secret_key)
+                is_request_signed = True
+            except InvalidSignatureError as sig_err:
+                print(f"[Server Security Error] Invalid signature from {addr}: {sig_err}")
+                err_resp = serialize_result(f"Security Error: {sig_err}", status="error")
+                err_resp = sign_payload(err_resp, secret_key, is_result=True)
+                try:
+                    await loop.sock_sendto(sock, err_resp, addr)
+                except OSError:
+                    pass
+                return
+        else:
+            print(f"[Server Security Error] Received signed task from {addr} but server has no secret_key configured.")
+            err_resp = serialize_result("Security Error: Server has no secret_key to verify signature", status="error")
+            try:
+                await loop.sock_sendto(sock, err_resp, addr)
+            except OSError:
+                pass
+            return
+    elif enforce_signatures and is_task_payload(data):
+        print(f"[Server Security Error] Rejected unsigned task payload from {addr} (signatures enforced).")
+        err_resp = serialize_result("Security Error: Cryptographic signature required", status="error")
+        if secret_key:
+            err_resp = sign_payload(err_resp, secret_key, is_result=True)
+        try:
+            await loop.sock_sendto(sock, err_resp, addr)
+        except OSError:
+            pass
+        return
+
     # --- Route 1: Kademlia DHT Discovery Message ---
     if is_dht_payload(data):
         if dht_node:
@@ -125,15 +171,21 @@ async def handle_message(
         print(f"[Server] Received task payload from {addr} ({len(data)} bytes)")
 
         async def _execute_and_send(task_data: bytes, target_addr: Tuple[str, int]) -> None:
-            nonlocal task_registry
+            nonlocal task_registry, secret_key, is_request_signed
             task_id = peek_task_id(task_data)
+
+            def _prepare_outgoing(resp_data: bytes) -> bytes:
+                if secret_key and (is_request_signed or enforce_signatures):
+                    return sign_payload(resp_data, secret_key, is_result=True)
+                return resp_data
 
             # Fallback for untracked / legacy tasks without task_id or without registry
             if not task_id or task_registry is None:
                 try:
                     result_bytes = await asyncio.to_thread(execute_task, task_data)
-                    await loop.sock_sendto(sock, result_bytes, target_addr)
-                    print(f"[Server] Sent legacy task result to {target_addr} ({len(result_bytes)} bytes)")
+                    out_bytes = _prepare_outgoing(result_bytes)
+                    await loop.sock_sendto(sock, out_bytes, target_addr)
+                    print(f"[Server] Sent legacy task result to {target_addr} ({len(out_bytes)} bytes)")
                 except OSError as send_err:
                     print(f"[Server] Failed to send legacy task result to {target_addr}: {send_err}")
                 return
@@ -145,7 +197,8 @@ async def handle_message(
             if state in (TaskState.COMPLETED, TaskState.FAILED) and cached_bytes is not None:
                 print(f"[Server] Duplicate Task [{task_id}] detected in state {state.value}. Returning cached result.")
                 try:
-                    await loop.sock_sendto(sock, cached_bytes, target_addr)
+                    out_bytes = _prepare_outgoing(cached_bytes)
+                    await loop.sock_sendto(sock, out_bytes, target_addr)
                 except OSError as send_err:
                     print(f"[Server] Failed to send cached result for [{task_id}] to {target_addr}: {send_err}")
                 return
@@ -155,8 +208,9 @@ async def handle_message(
                 print(f"[Server] Concurrent duplicate Task [{task_id}] is currently RUNNING. Waiting for in-flight execution...")
                 try:
                     result_bytes = await waiter_fut
-                    await loop.sock_sendto(sock, result_bytes, target_addr)
-                    print(f"[Server] Sent in-flight result for [{task_id}] to {target_addr} ({len(result_bytes)} bytes)")
+                    out_bytes = _prepare_outgoing(result_bytes)
+                    await loop.sock_sendto(sock, out_bytes, target_addr)
+                    print(f"[Server] Sent in-flight result for [{task_id}] to {target_addr} ({len(out_bytes)} bytes)")
                 except Exception as wait_err:
                     print(f"[Server] Error waiting for in-flight task [{task_id}]: {wait_err}")
                 return
@@ -174,13 +228,15 @@ async def handle_message(
                 else:
                     task_registry.fail_task(task_id, result_bytes)
 
-                await loop.sock_sendto(sock, result_bytes, target_addr)
-                print(f"[Server] Sent task [{task_id}] result to {target_addr} ({len(result_bytes)} bytes)")
+                out_bytes = _prepare_outgoing(result_bytes)
+                await loop.sock_sendto(sock, out_bytes, target_addr)
+                print(f"[Server] Sent task [{task_id}] result to {target_addr} ({len(out_bytes)} bytes)")
             except Exception as exec_err:
                 error_bytes = serialize_result(str(exec_err), status="error", task_id=task_id)
                 task_registry.fail_task(task_id, error_bytes)
                 try:
-                    await loop.sock_sendto(sock, error_bytes, target_addr)
+                    out_bytes = _prepare_outgoing(error_bytes)
+                    await loop.sock_sendto(sock, out_bytes, target_addr)
                 except OSError as send_err:
                     print(f"[Server] Failed to send error result for [{task_id}] to {target_addr}: {send_err}")
 
@@ -226,6 +282,8 @@ async def run_server(
     dht_node: DHTNode | None = None,
     gossip_engine: GossipEngine | None = None,
     task_registry: TaskExecutionRegistry | None = None,
+    secret_key: Optional[bytes | str] = None,
+    enforce_signatures: bool = False,
 ) -> None:
     """
     Runs the asynchronous UDP server event loop.
@@ -239,6 +297,8 @@ async def run_server(
         dht_node: Optional active DHTNode controller instance.
         gossip_engine: Optional active GossipEngine instance.
         task_registry: Optional active TaskExecutionRegistry for task deduplication.
+        secret_key: Optional HMAC-SHA256 secret key for task authentication and verification.
+        enforce_signatures: Whether to reject unsigned task payloads strictly.
     """
     if task_registry is None:
         task_registry = TaskExecutionRegistry()
@@ -259,6 +319,8 @@ async def run_server(
     if gossip_engine:
         print(f"Gossip Engine active (Interval: {gossip_engine.interval}s)")
         gossip_engine.start(loop=loop, sock=sock)
+    if secret_key:
+        print(f"Security: HMAC-SHA256 Cryptographic Signatures Enabled (Enforce: {enforce_signatures})")
     print("Waiting for incoming messages...\n", flush=True)
 
     try:
@@ -276,6 +338,8 @@ async def run_server(
                     dht_node=dht_node,
                     gossip_engine=gossip_engine,
                     task_registry=task_registry,
+                    secret_key=secret_key,
+                    enforce_signatures=enforce_signatures,
                 )
             except asyncio.CancelledError:
                 # Raised when the server task is cancelled during shutdown
